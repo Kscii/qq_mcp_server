@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
+import pytest
 from fastmcp import Client
 
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
-from qq_mcp_server.mcp_server import _oauth_storage_path, create_mcp_servers
+from qq_mcp_server.mcp_server import _auth_provider, create_mcp_servers
 from qq_mcp_server.models import ChatMessage
 from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.store import MessageStore
@@ -26,15 +28,21 @@ class FakeOneBot:
         ]
 
 
-def test_oauth_storage_isolated_from_incompatible_legacy_records(config: AppConfig) -> None:
+def test_oauth_provider_creates_versioned_storage_before_sanitizers(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     legacy_record = config.oauth_storage_dir / "clients" / "legacy-client"
     legacy_record.parent.mkdir(parents=True)
     legacy_record.write_text("encrypted-with-v1-salt")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-secret")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "jwt-signing-key-for-tests")
+    monkeypatch.setenv("MCP_STORAGE_ENCRYPTION_KEY", "storage-encryption-key-for-tests")
 
-    storage_path = _oauth_storage_path(config)
+    provider = _auth_provider(replace(config, public_url="https://mcp.example.com"))
 
-    assert storage_path == config.oauth_storage_dir / "v2"
-    assert not storage_path.exists()
+    assert provider is not None
+    assert (config.oauth_storage_dir / "v2").is_dir()
     assert legacy_record.read_text() == "encrypted-with-v1-salt"
 
 

@@ -64,15 +64,17 @@ def _required_secret(name: str) -> str:
     return value
 
 
-def _oauth_storage_path(config: AppConfig) -> Path:
+def _prepare_oauth_storage_path(config: AppConfig) -> Path:
     """Keep encrypted OAuth records isolated from incompatible key derivation schemas."""
-    return config.oauth_storage_dir / _OAUTH_STORAGE_SCHEMA
+    storage_path = config.oauth_storage_dir / _OAUTH_STORAGE_SCHEMA
+    storage_path.mkdir(parents=True, exist_ok=True)
+    return storage_path
 
 
 def _auth_provider(config: AppConfig) -> GoogleProvider | None:
     if config.public_url is None:
         return None
-    oauth_storage_path = _oauth_storage_path(config)
+    oauth_storage_path = _prepare_oauth_storage_path(config)
     storage = FileTreeStore(
         data_directory=oauth_storage_path,
         key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(oauth_storage_path),
@@ -84,6 +86,7 @@ def _auth_provider(config: AppConfig) -> GoogleProvider | None:
         key_value=storage,
         source_material=_required_secret("MCP_STORAGE_ENCRYPTION_KEY"),
         salt="qq_mcp_server_oauth_v2",
+        raise_on_decryption_error=False,
     )
     return GoogleProvider(
         client_id=_required_secret("GOOGLE_OAUTH_CLIENT_ID"),

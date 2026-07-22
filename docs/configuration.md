@@ -54,7 +54,8 @@ qq_mcp_server prepare-napcat DIRECTORY
 - `rules` / `RULES_DATABASE_PATH`：离线构建的三书索引。
 - `timezone`：MCP 展示消息时间使用的 IANA 时区。
 - `oauth` / `OAUTH_STORAGE_DIR`：Google OAuth 持久化状态的根目录；服务按不兼容的
-  加密格式在其中使用版本化子目录，升级时不会误读旧密文。
+  加密格式在其中使用版本化子目录，无法解密的缓存按未命中处理，升级或密钥轮换时
+  不会因旧密文阻断授权。
 
 `[server]`：
 
