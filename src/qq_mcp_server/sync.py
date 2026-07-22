@@ -161,7 +161,6 @@ class SyncService:
         return SyncResult(received, text_total, inserted_total, pages, True, boundary_found)
 
     async def run_forever(self) -> None:
-        delay = self.config.poll_interval_seconds
         while True:
             try:
                 state = self.store.state(self.config.group_id)
@@ -176,7 +175,6 @@ class SyncService:
                     result.received,
                     result.inserted,
                 )
-                delay = self.config.poll_interval_seconds
             except asyncio.CancelledError:
                 raise
             except Exception as error:
@@ -186,5 +184,4 @@ class SyncService:
                     group_id=self.config.group_id,
                     error=f"{type(error).__name__}: {error}",
                 )
-                delay = min(max(delay * 2, 15), 300)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(self.config.poll_interval_seconds)
