@@ -9,7 +9,7 @@ from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
 
-from qq_mcp_server.cards import CharacterCardService
+from qq_mcp_server.cards import CharacterCardService, ParsedCard
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.onebot import OneBotClient
 from qq_mcp_server.store import MessageStore
@@ -167,6 +167,7 @@ def register_web_routes(
                     "staged_path": str(staged),
                     "source_filename": filename,
                     "preview": preview,
+                    "parsed_card": parsed.staging_payload(),
                 },
             )
             default_policy = str(preview["default_runtime_policy"])
@@ -202,11 +203,16 @@ def register_web_routes(
                 raise ValueError("待确认人物卡不存在，请重新上传")
             form = await request.form()
             policy = str(form.get("runtime_policy") or "auto")
+            source_filename = str(payload.get("source_filename") or "character.xlsx")
+            parsed = ParsedCard.from_staging_payload(
+                payload.get("parsed_card"), source_filename=source_filename
+            )
             result = cards.finalize(
                 str(capability["group_key"]),
                 staged_path=staged_path,
-                source_filename=str(payload.get("source_filename") or "character.xlsx"),
+                source_filename=source_filename,
                 runtime_policy=policy,
+                parsed=parsed,
             )
             store.capability(token, kind="character_card", consume=True)
             warning = ""

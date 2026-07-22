@@ -58,8 +58,10 @@ async def test_whitelist_web_page_and_group_route_guard(config: AppConfig) -> No
     assert store.get_group_by_qq("2") is not None
 
 
-async def test_character_upload_preview_and_confirm(config: AppConfig, tmp_path: Path) -> None:
-    store, _, _, app = services(config)
+async def test_character_upload_preview_and_confirm(
+    config: AppConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, _, cards, app = services(config)
     group = store.whitelist_group("2", "测试群")
     token = store.issue_capability(
         kind="character_card",
@@ -82,6 +84,11 @@ async def test_character_upload_preview_and_confirm(config: AppConfig, tmp_path:
         )
         assert preview.status_code == 200
         assert "确认人物卡" in preview.text
+
+        def unexpected_reparse(_: Path) -> None:
+            raise AssertionError("确认阶段不应再次解析人物卡")
+
+        monkeypatch.setattr(cards.parser, "parse", unexpected_reparse)
         confirmed = await client.post(
             f"/uploads/character-card/{token}/confirm", data={"runtime_policy": "auto"}
         )
@@ -90,6 +97,46 @@ async def test_character_upload_preview_and_confirm(config: AppConfig, tmp_path:
     character = store.character(str(group["group_key"]))
     assert character is not None
     assert character["current"]["identity"]["name"] == "调查员"
+
+
+async def test_character_confirm_rejects_changed_staged_file(
+    config: AppConfig, tmp_path: Path
+) -> None:
+    store, _, _, app = services(config)
+    group = store.whitelist_group("2", "测试群")
+    token = store.issue_capability(
+        kind="character_card",
+        group_key=str(group["group_key"]),
+        issued_to="local",
+        ttl_seconds=600,
+    )
+    card_path = make_card(tmp_path / "调查员.xlsx")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        preview = await client.post(
+            f"/uploads/character-card/{token}",
+            files={
+                "card": (
+                    card_path.name,
+                    card_path.read_bytes(),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+        assert preview.status_code == 200
+        payload = store.capability(token, kind="character_card")["payload"]
+        staged_path = Path(str(payload["staged_path"]))
+        staged_path.write_bytes(  # noqa: ASYNC240 - isolated local test fixture
+            staged_path.read_bytes() + b"changed-after-preview"  # noqa: ASYNC240
+        )
+
+        confirmed = await client.post(
+            f"/uploads/character-card/{token}/confirm", data={"runtime_policy": "auto"}
+        )
+
+    assert confirmed.status_code == 400
+    assert "预览后发生变化" in confirmed.text
+    assert store.character(str(group["group_key"])) is None
 
 
 async def test_admin_and_dynamic_group_http_endpoints_initialize(config: AppConfig) -> None:

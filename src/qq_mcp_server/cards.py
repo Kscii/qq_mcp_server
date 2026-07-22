@@ -6,16 +6,19 @@ import os
 import re
 import secrets
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
+from openpyxl.utils import get_column_letter
 
 from qq_mcp_server.store import MessageStore
 
 TEMPLATE_ID = "beier_black_gold_23_1_1"
+_MAX_CARD_ROW = 140
+_MAX_CARD_COLUMN = 44  # AR
 
 
 def _sha256(path: Path) -> str:
@@ -82,12 +85,43 @@ class ParsedCard:
     def character_name(self) -> str:
         return str(self.document["identity"]["name"])
 
+    def staging_payload(self) -> dict[str, Any]:
+        return {"document": self.document, "source_sha256": self.source_sha256}
+
+    @classmethod
+    def from_staging_payload(cls, payload: object, *, source_filename: str) -> ParsedCard:
+        if not isinstance(payload, dict):
+            raise ValueError("人物卡预览数据不存在，请重新上传")
+        document = payload.get("document")
+        source_sha256 = payload.get("source_sha256")
+        if not isinstance(document, dict) or not isinstance(source_sha256, str):
+            raise ValueError("人物卡预览数据无效，请重新上传")
+        if re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None:
+            raise ValueError("人物卡文件摘要无效，请重新上传")
+        return cls(cast(dict[str, Any], document), source_sha256, source_filename)
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotCell:
+    value: object
+
+
+class _SheetSnapshot:
+    """固定区域的内存快照，避免只读工作表反复扫描 XML。"""
+
+    def __init__(self, values: Mapping[str, object], max_row: int) -> None:
+        self._values = values
+        self.max_row = max_row
+
+    def __getitem__(self, coordinate: str) -> _SnapshotCell:
+        return _SnapshotCell(self._values.get(coordinate))
+
 
 class FixedCharacterCardParser:
     """只识别已经锁定的浅蓝色 23.1.1 人物卡。"""
 
     @staticmethod
-    def _verify(sheet: Worksheet) -> None:
+    def _verify(sheet: _SheetSnapshot) -> None:
         anchors = {"J3": "玩家", "F16": "技能名称", "F79": "物品名称"}
         mismatches = [
             f"{coordinate}={sheet[coordinate].value!r}"
@@ -104,21 +138,33 @@ class FixedCharacterCardParser:
         if source.stat().st_size > 16 * 1024 * 1024:
             raise ValueError("人物卡文件不能超过 16 MiB")
 
-        formula_book = load_workbook(source, read_only=True, data_only=False)
-        value_book = load_workbook(source, read_only=True, data_only=True)
+        value_book = load_workbook(source, read_only=True, data_only=True, keep_links=False)
         try:
-            if "人物卡" not in formula_book.sheetnames or "人物卡" not in value_book.sheetnames:
+            if "人物卡" not in value_book.sheetnames:
                 raise ValueError("工作簿缺少 人物卡 工作表")
-            formula_sheet = formula_book["人物卡"]
             sheet = value_book["人物卡"]
-            self._verify(formula_sheet)
-            document = self._parse_sheet(sheet)
+            final_row = min(sheet.max_row or _MAX_CARD_ROW, _MAX_CARD_ROW)
+            values = {
+                f"{get_column_letter(column_index)}{row_index}": cell.value
+                for row_index, row in enumerate(
+                    sheet.iter_rows(
+                        min_row=1,
+                        max_row=final_row,
+                        min_col=1,
+                        max_col=_MAX_CARD_COLUMN,
+                    ),
+                    start=1,
+                )
+                for column_index, cell in enumerate(row, start=1)
+            }
+            snapshot = _SheetSnapshot(values, final_row)
+            self._verify(snapshot)
+            document = self._parse_sheet(snapshot)
         finally:
-            formula_book.close()
             value_book.close()
         return ParsedCard(document, _sha256(source), source.name)
 
-    def _parse_sheet(self, sheet: Worksheet) -> dict[str, Any]:
+    def _parse_sheet(self, sheet: _SheetSnapshot) -> dict[str, Any]:
         provenance: dict[str, list[str]] = {}
 
         def value(coordinate: str, pointer: str) -> object:
@@ -503,8 +549,10 @@ class CharacterCardService:
         staged_path: Path,
         source_filename: str,
         runtime_policy: str,
+        parsed: ParsedCard,
     ) -> dict[str, Any]:
-        parsed = self.parser.parse(staged_path)
+        if not secrets.compare_digest(_sha256(staged_path), parsed.source_sha256):
+            raise ValueError("待确认人物卡在预览后发生变化，请重新上传")
         previous = self.store.character(group_key)
         policy = runtime_policy
         if policy == "auto":

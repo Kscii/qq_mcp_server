@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
+import qq_mcp_server.cards as cards_module
 from qq_mcp_server.cards import FixedCharacterCardParser
 
 
@@ -75,6 +76,24 @@ def test_fixed_card_parses_all_meaningful_sections_and_ignores_other_sheets(
     assert card["background"]["important_people"] == "大学导师"
     assert card["inventory"][0]["name"] == "录音笔"
     assert "不应读取" not in str(card)
+
+
+def test_fixed_card_loads_one_workbook_and_streams_cached_values_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = make_card(tmp_path / "card.xlsx")
+    real_load_workbook = cards_module.load_workbook
+    calls: list[dict[str, object]] = []
+
+    def tracked_load_workbook(*args: object, **kwargs: object) -> object:
+        calls.append(kwargs)
+        return real_load_workbook(*args, **kwargs)
+
+    monkeypatch.setattr(cards_module, "load_workbook", tracked_load_workbook)
+    card = FixedCharacterCardParser().parse(path)
+
+    assert card.character_name == "调查员"
+    assert calls == [{"read_only": True, "data_only": True, "keep_links": False}]
 
 
 def test_blank_template_is_recognized_but_cannot_be_bound(tmp_path: Path) -> None:
