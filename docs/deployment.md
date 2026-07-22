@@ -80,7 +80,7 @@ Google OAuth Web Application 回调地址必须精确填写
 
 ## 发布与回滚
 
-推送 `v0.2.0` 形式且与 `pyproject.toml` 版本一致的标签后，GitHub Actions 会：
+推送 `vX.Y.Z` 形式且与 `pyproject.toml` 版本一致的标签后，GitHub Actions 会：
 
 1. 执行格式、类型和测试检查。
 2. 构建 wheel 并创建 GitHub Release。

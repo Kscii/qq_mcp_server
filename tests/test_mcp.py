@@ -6,7 +6,7 @@ from fastmcp import Client
 
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
-from qq_mcp_server.mcp_server import create_mcp_servers
+from qq_mcp_server.mcp_server import _oauth_storage_path, create_mcp_servers
 from qq_mcp_server.models import ChatMessage
 from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.store import MessageStore
@@ -24,6 +24,18 @@ class FakeOneBot:
                 "onebot_role": "member",
             }
         ]
+
+
+def test_oauth_storage_isolated_from_incompatible_legacy_records(config: AppConfig) -> None:
+    legacy_record = config.oauth_storage_dir / "clients" / "legacy-client"
+    legacy_record.parent.mkdir(parents=True)
+    legacy_record.write_text("encrypted-with-v1-salt")
+
+    storage_path = _oauth_storage_path(config)
+
+    assert storage_path == config.oauth_storage_dir / "v2"
+    assert not storage_path.exists()
+    assert legacy_record.read_text() == "encrypted-with-v1-salt"
 
 
 def message(message_id: str, text: str) -> ChatMessage:

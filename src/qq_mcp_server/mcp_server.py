@@ -4,6 +4,7 @@ import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,7 @@ _DESTRUCTIVE = {
     "idempotentHint": False,
     "openWorldHint": False,
 }
+_OAUTH_STORAGE_SCHEMA = "v2"
 
 
 def _required_secret(name: str) -> str:
@@ -62,14 +64,20 @@ def _required_secret(name: str) -> str:
     return value
 
 
+def _oauth_storage_path(config: AppConfig) -> Path:
+    """Keep encrypted OAuth records isolated from incompatible key derivation schemas."""
+    return config.oauth_storage_dir / _OAUTH_STORAGE_SCHEMA
+
+
 def _auth_provider(config: AppConfig) -> GoogleProvider | None:
     if config.public_url is None:
         return None
+    oauth_storage_path = _oauth_storage_path(config)
     storage = FileTreeStore(
-        data_directory=config.oauth_storage_dir,
-        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(config.oauth_storage_dir),
+        data_directory=oauth_storage_path,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(oauth_storage_path),
         collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
-            config.oauth_storage_dir
+            oauth_storage_path
         ),
     )
     encrypted_storage = FernetEncryptionWrapper(
