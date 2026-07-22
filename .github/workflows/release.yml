@@ -1,0 +1,88 @@
+name: Release and deploy
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  PROJECT_ID: project-51b589c7-8d5e-4e78-a10
+  REGION: australia-southeast1
+  ZONE: australia-southeast1-a
+  INSTANCE: qq-mcp-server
+  IMAGE: australia-southeast1-docker.pkg.dev/project-51b589c7-8d5e-4e78-a10/qq-mcp-server/app
+  WORKLOAD_IDENTITY_PROVIDER: projects/703043601187/locations/global/workloadIdentityPools/github-actions/providers/qq-mcp-server
+  DEPLOY_SERVICE_ACCOUNT: github-qq-mcp-deployer@project-51b589c7-8d5e-4e78-a10.iam.gserviceaccount.com
+
+jobs:
+  test-build-release:
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.image.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.30"
+          enable-cache: true
+      - run: uv sync --frozen --all-groups
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src
+      - run: uv run pytest
+      - name: 校验版本号与标签一致
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$expected" = "$actual"
+      - run: uv build
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+      - uses: docker/setup-buildx-action@v3
+      - id: image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
+
+  deploy:
+    needs: test-build-release
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v3
+      - name: 上传部署清单
+        run: |
+          tar -czf /tmp/qq-mcp-server-deploy.tar.gz deploy
+          gcloud compute scp /tmp/qq-mcp-server-deploy.tar.gz \
+            "${INSTANCE}:/tmp/qq-mcp-server-deploy.tar.gz" \
+            --zone "$ZONE" --tunnel-through-iap --quiet
+      - name: 部署不可变镜像
+        env:
+          DIGEST: ${{ needs.test-build-release.outputs.digest }}
+        run: |
+          image_ref="${IMAGE}@${DIGEST}"
+          gcloud compute ssh "$INSTANCE" --zone "$ZONE" \
+            --tunnel-through-iap --quiet \
+            --command="sudo install -d -m 0750 /opt/qq_mcp_server && sudo tar -xzf /tmp/qq-mcp-server-deploy.tar.gz -C /opt/qq_mcp_server --strip-components=1 --exclude='.env' --exclude='deploy.env' && sudo chmod 700 /opt/qq_mcp_server/*.sh && sudo /opt/qq_mcp_server/deploy-image.sh '$image_ref'"

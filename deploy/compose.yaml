@@ -1,0 +1,73 @@
+name: qq-mcp-server
+
+services:
+  napcat:
+    image: docker.io/mlikiowa/napcat-docker@sha256:11d72e50b6edc01b20f1a7611a250720e61412fe96184e3c70c3b8cf976744e1
+    container_name: qq-mcp-server-napcat
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    environment:
+      ACCOUNT: ${QQ_ACCOUNT_ID:?请在 .env 设置 QQ_ACCOUNT_ID}
+      NAPCAT_UID: ${HOST_UID:-1001}
+      NAPCAT_GID: ${HOST_GID:-1002}
+    volumes:
+      - ${DATA_DIR:-/var/lib/qq_mcp_server}/napcat/config:/app/napcat/config
+      - ${DATA_DIR:-/var/lib/qq_mcp_server}/napcat/qq:/app/.config/QQ
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  app:
+    image: ${APP_IMAGE:?请通过 deploy.env 设置 APP_IMAGE}
+    container_name: qq-mcp-server-app
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    user: "${HOST_UID:-1001}:${HOST_GID:-1002}"
+    env_file:
+      - .env
+    command: ["-c", "/config/config.toml", "run"]
+    depends_on:
+      - napcat
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ./config.server.toml:/config/config.toml:ro
+      - ${DATA_DIR:-/var/lib/qq_mcp_server}:/data
+    healthcheck:
+      test: ["CMD", "qq_mcp_server", "-c", "/config/config.toml", "status", "--json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  caddy:
+    image: docker.io/library/caddy:2.10.2-alpine
+    container_name: qq-mcp-server-caddy
+    profiles: ["public"]
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${DATA_DIR:-/var/lib/qq_mcp_server}/caddy/data:/data
+      - ${DATA_DIR:-/var/lib/qq_mcp_server}/caddy/config:/config
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"

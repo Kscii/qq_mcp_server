@@ -1,0 +1,15 @@
+/.venv/
+/dist/
+/build/
+/.coverage
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.env
+config.toml
+/data/

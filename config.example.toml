@@ -1,0 +1,24 @@
+[qq]
+account_id = "123456789"
+group_id = "987654321"
+group_name = "示例群"
+onebot_url = "http://127.0.0.1:3000"
+poll_interval_seconds = 15
+page_size = 100
+request_timeout_seconds = 20
+history_timeout_seconds = 90
+# history_since = "2026-01-01T00:00:00+08:00"
+
+[storage]
+database = "data/messages.sqlite3"
+export = "data/groups/987654321.txt"
+timezone = "Asia/Shanghai"
+oauth = "data/oauth"
+
+[server]
+host = "127.0.0.1"
+port = 8000
+# public_url = "https://qq-mcp.example.com"
+
+[access]
+# allowed_google_emails = ["you@gmail.com"]

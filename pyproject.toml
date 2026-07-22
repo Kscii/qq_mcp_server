@@ -1,0 +1,61 @@
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[project]
+name = "qq_mcp_server"
+version = "0.1.0"
+description = "只读同步 QQ 群文字消息并通过纯文本和 MCP 提供查询"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "kscii", email = "xuejian-fang@outlook.com" }]
+keywords = ["qq", "mcp", "onebot", "napcat"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Communications :: Chat",
+]
+dependencies = [
+  "fastmcp>=3.1,<4",
+  "httpx>=0.28,<1",
+  "tzdata>=2026.1",
+]
+
+[project.scripts]
+qq_mcp_server = "qq_mcp_server.cli:main"
+
+[dependency-groups]
+dev = [
+  "mypy>=1.18,<2",
+  "pytest>=9,<10",
+  "pytest-asyncio>=1.2,<2",
+  "pytest-cov>=7,<8",
+  "ruff>=0.14,<1",
+]
+
+[tool.uv.build-backend]
+module-name = "qq_mcp_server"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live: opt-in tests against an explicitly configured QQ group"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["qq_mcp_server"]
