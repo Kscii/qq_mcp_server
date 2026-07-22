@@ -5,6 +5,8 @@ from typing import Any
 
 import pytest
 from fastmcp import Client
+from mcp.server.auth.provider import AuthorizationParams
+from mcp.shared.auth import OAuthClientInformationFull
 
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
@@ -28,7 +30,7 @@ class FakeOneBot:
         ]
 
 
-def test_oauth_provider_creates_versioned_storage_before_sanitizers(
+async def test_oauth_provider_accepts_exact_admin_and_group_resources(
     config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     legacy_record = config.oauth_storage_dir / "clients" / "legacy-client"
@@ -39,11 +41,36 @@ def test_oauth_provider_creates_versioned_storage_before_sanitizers(
     monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "jwt-signing-key-for-tests")
     monkeypatch.setenv("MCP_STORAGE_ENCRYPTION_KEY", "storage-encryption-key-for-tests")
 
-    provider = _auth_provider(replace(config, public_url="https://mcp.example.com"))
+    public_config = replace(config, public_url="https://mcp.example.com")
+    store = MessageStore(public_config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    provider = _auth_provider(public_config, store)
 
     assert provider is not None
     assert (config.oauth_storage_dir / "v2").is_dir()
     assert legacy_record.read_text() == "encrypted-with-v1-salt"
+    resources = [
+        "https://mcp.example.com/mcp/admin",
+        f"https://mcp.example.com/mcp/groups/{group['group_key']}",
+    ]
+    for index, resource in enumerate(resources):
+        client = OAuthClientInformationFull(
+            client_id=f"client-{index}",
+            redirect_uris=[f"https://chatgpt.example/callback/{index}"],
+            token_endpoint_auth_method="none",
+        )
+        redirect = await provider.authorize(
+            client,
+            AuthorizationParams(
+                state=f"state-{index}",
+                scopes=["openid"],
+                code_challenge="challenge",
+                redirect_uri=f"https://chatgpt.example/callback/{index}",
+                redirect_uri_provided_explicitly=True,
+                resource=resource,
+            ),
+        )
+        assert redirect.startswith("https://mcp.example.com/consent?txn_id=")
 
 
 def message(message_id: str, text: str) -> ChatMessage:

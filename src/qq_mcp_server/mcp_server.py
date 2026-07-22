@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import os
-from collections.abc import AsyncIterator, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from typing import Any, override
+from typing import Any, cast, override
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
-from fastmcp.server.auth import AuthContext
+from fastmcp.server.auth import AccessToken, AuthContext
+from fastmcp.server.auth.jwt_issuer import JWTIssuer
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token, get_http_request
 from key_value.aio.stores.filetree import (
@@ -18,6 +24,17 @@ from key_value.aio.stores.filetree import (
     FileTreeV1KeySanitizationStrategy,
 )
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from mcp.server.auth.provider import (
+    AccessToken as SDKAccessToken,
+)
+from mcp.server.auth.provider import (
+    AuthorizationCode,
+    AuthorizationParams,
+    AuthorizeError,
+    RefreshToken,
+    TokenError,
+)
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -58,22 +75,195 @@ _DESTRUCTIVE = {
     "openWorldHint": False,
 }
 _OAUTH_STORAGE_SCHEMA = "v2"
+_RESOURCE_BINDINGS_COLLECTION = "qq-mcp-resource-bindings-v1"
 
 
-class _CanonicalResourceGoogleProvider(GoogleProvider):
-    """Use one OAuth audience for the admin and all per-group MCP endpoints."""
+class _DynamicResourceGoogleProvider(GoogleProvider):
+    """Bind each ChatGPT connector token to its exact admin or group MCP URL."""
+
+    _resource_validator: Callable[[str], bool]
+
+    def configure_resource_validation(
+        self, resource_validator: Callable[[str], bool]
+    ) -> _DynamicResourceGoogleProvider:
+        self._resource_validator = resource_validator
+        self._authorize_lock = asyncio.Lock()
+        self._active_resource: ContextVar[str | None] = ContextVar(
+            "qq_mcp_oauth_resource", default=None
+        )
+        self._resource_issuers: dict[str, JWTIssuer] = {}
+        return self
+
+    def _issuer_for(self, resource: str) -> JWTIssuer:
+        issuer = self._resource_issuers.get(resource)
+        if issuer is None:
+            assert self.base_url is not None
+            issuer = JWTIssuer(
+                issuer=str(self.base_url),
+                audience=resource,
+                signing_key=self._jwt_signing_key,
+            )
+            self._resource_issuers[resource] = issuer
+        return issuer
+
+    @contextmanager
+    def _use_resource(self, resource: str) -> Iterator[None]:
+        token = self._active_resource.set(resource)
+        try:
+            yield
+        finally:
+            self._active_resource.reset(token)
 
     @override
-    def _get_resource_url(self, path: str | None = None) -> AnyHttpUrl:
-        assert self.base_url is not None
-        return AnyHttpUrl(f"{str(self.base_url).rstrip('/')}/mcp")
+    @property
+    def jwt_issuer(self) -> JWTIssuer:
+        resource = self._active_resource.get()
+        return self._issuer_for(resource) if resource else super().jwt_issuer
 
-    async def _resource_metadata_alias(self, _: Request) -> JSONResponse:
-        assert self._resource_url is not None
+    async def _bind_client_resource(self, client_id: str, resource: str) -> None:
+        await self._client_storage.put(
+            key=client_id,
+            value={"resource": resource},
+            collection=_RESOURCE_BINDINGS_COLLECTION,
+        )
+
+    async def _client_resource(self, client_id: str | None) -> str | None:
+        if not client_id:
+            return None
+        value = await self._client_storage.get(
+            key=client_id,
+            collection=_RESOURCE_BINDINGS_COLLECTION,
+        )
+        resource = str(value.get("resource")) if value and value.get("resource") else None
+        return resource if resource and self._resource_validator(resource) else None
+
+    @staticmethod
+    def _token_resource(token: str) -> str | None:
+        try:
+            payload = token.split(".", 2)[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            audience = claims.get("aud")
+            return audience if isinstance(audience, str) else None
+        except (IndexError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    def _matches_current_mcp_request(self, resource: str) -> bool:
+        try:
+            request = get_http_request()
+        except RuntimeError:
+            return True
+        if not request.url.path.startswith("/mcp/"):
+            return True
+        assert self.base_url is not None
+        expected = f"{str(self.base_url).rstrip('/')}{request.url.path}"
+        return resource.rstrip("/") == expected.rstrip("/")
+
+    @override
+    async def authorize(
+        self,
+        client: OAuthClientInformationFull,
+        params: AuthorizationParams,
+    ) -> str:
+        resource = params.resource
+        if not resource or not self._resource_validator(resource):
+            raise AuthorizeError(
+                error="invalid_request",
+                error_description="Unknown MCP resource",
+            )
+        if client.client_id is None:
+            raise AuthorizeError(
+                error="invalid_request",
+                error_description="Client ID is required",
+            )
+        await self._bind_client_resource(client.client_id, resource)
+        async with self._authorize_lock:
+            original_resource = self._resource_url
+            original_issuer = self._jwt_issuer
+            self._resource_url = AnyHttpUrl(resource)
+            self._jwt_issuer = self._issuer_for(resource)
+            try:
+                return await super().authorize(client, params)
+            finally:
+                self._resource_url = original_resource
+                self._jwt_issuer = original_issuer
+
+    @override
+    async def load_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: str,
+    ) -> AuthorizationCode | None:
+        code = await super().load_authorization_code(client, authorization_code)
+        resource = await self._client_resource(client.client_id)
+        return code.model_copy(update={"resource": resource}) if code and resource else code
+
+    @override
+    async def exchange_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
+    ) -> OAuthToken:
+        resource = authorization_code.resource or await self._client_resource(client.client_id)
+        if not resource:
+            raise TokenError("invalid_grant", "MCP resource binding not found")
+        with self._use_resource(resource):
+            return await super().exchange_authorization_code(client, authorization_code)
+
+    @override
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        resource = self._token_resource(token)
+        if (
+            not resource
+            or not self._resource_validator(resource)
+            or not self._matches_current_mcp_request(resource)
+        ):
+            return None
+        with self._use_resource(resource):
+            return cast(AccessToken | None, await super().load_access_token(token))
+
+    @override
+    async def load_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: str,
+    ) -> RefreshToken | None:
+        resource = self._token_resource(refresh_token)
+        if not resource or not self._resource_validator(resource):
+            return None
+        with self._use_resource(resource):
+            return await super().load_refresh_token(client, refresh_token)
+
+    @override
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        resource = self._token_resource(refresh_token.token)
+        if not resource or not self._resource_validator(resource):
+            raise TokenError("invalid_grant", "Unknown MCP resource")
+        with self._use_resource(resource):
+            return await super().exchange_refresh_token(client, refresh_token, scopes)
+
+    @override
+    async def revoke_token(self, token: SDKAccessToken | RefreshToken) -> None:
+        resource = self._token_resource(token.token)
+        if not resource or not self._resource_validator(resource):
+            return
+        with self._use_resource(resource):
+            await super().revoke_token(token)
+
+    async def _group_resource_metadata(self, request: Request) -> JSONResponse:
         assert self.issuer_url is not None
+        assert self.base_url is not None
+        resource = f"{str(self.base_url).rstrip('/')}/mcp/groups/{request.path_params['group_key']}"
+        if not self._resource_validator(resource):
+            return JSONResponse({"error": "group_not_whitelisted"}, status_code=404)
         return JSONResponse(
             {
-                "resource": str(self._resource_url),
+                "resource": resource,
                 "authorization_servers": [str(self.issuer_url)],
                 "scopes_supported": self.required_scopes,
                 "bearer_methods_supported": ["header"],
@@ -83,11 +273,11 @@ class _CanonicalResourceGoogleProvider(GoogleProvider):
     @override
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
-        if mcp_path and mcp_path != "/mcp":
+        if mcp_path == "/mcp/groups/{group_key}":
             routes.append(
                 Route(
-                    f"/.well-known/oauth-protected-resource/{mcp_path.lstrip('/')}",
-                    endpoint=self._resource_metadata_alias,
+                    "/.well-known/oauth-protected-resource/mcp/groups/{group_key}",
+                    endpoint=self._group_resource_metadata,
                     methods=["GET", "OPTIONS"],
                 )
             )
@@ -108,7 +298,37 @@ def _prepare_oauth_storage_path(config: AppConfig) -> Path:
     return storage_path
 
 
-def _auth_provider(config: AppConfig) -> _CanonicalResourceGoogleProvider | None:
+def _allowed_oauth_resource(config: AppConfig, store: MessageStore) -> Callable[[str], bool]:
+    assert config.public_url is not None
+    base = urlsplit(config.public_url)
+
+    def allowed(resource: str) -> bool:
+        parsed = urlsplit(resource)
+        if (
+            parsed.scheme != base.scheme
+            or parsed.netloc != base.netloc
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        if parsed.path.rstrip("/") == "/mcp/admin":
+            return True
+        prefix = "/mcp/groups/"
+        if not parsed.path.startswith(prefix):
+            return False
+        group_key = parsed.path[len(prefix) :].rstrip("/")
+        if not group_key or "/" in group_key:
+            return False
+        try:
+            store.get_group(group_key)
+        except KeyError:
+            return False
+        return True
+
+    return allowed
+
+
+def _auth_provider(config: AppConfig, store: MessageStore) -> _DynamicResourceGoogleProvider | None:
     if config.public_url is None:
         return None
     oauth_storage_path = _prepare_oauth_storage_path(config)
@@ -125,7 +345,7 @@ def _auth_provider(config: AppConfig) -> _CanonicalResourceGoogleProvider | None
         salt="qq_mcp_server_oauth_v2",
         raise_on_decryption_error=False,
     )
-    return _CanonicalResourceGoogleProvider(
+    return _DynamicResourceGoogleProvider(
         client_id=_required_secret("GOOGLE_OAUTH_CLIENT_ID"),
         client_secret=_required_secret("GOOGLE_OAUTH_CLIENT_SECRET"),
         base_url=config.public_url,
@@ -133,7 +353,7 @@ def _auth_provider(config: AppConfig) -> _CanonicalResourceGoogleProvider | None
         jwt_signing_key=_required_secret("MCP_JWT_SIGNING_KEY"),
         client_storage=encrypted_storage,
         require_authorization_consent=True,
-    )
+    ).configure_resource_validation(_allowed_oauth_resource(config, store))
 
 
 def _authorized_email(
@@ -291,7 +511,7 @@ def create_mcp_servers(
     *,
     group_key_override: str | None = None,
 ) -> tuple[FastMCP, FastMCP]:
-    auth = _auth_provider(config)
+    auth = _auth_provider(config, store)
     auth_check = _authorized_email(config, auth)
     admin = FastMCP(
         "TRPG 管理",
