@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
@@ -18,8 +18,11 @@ from key_value.aio.stores.filetree import (
     FileTreeV1KeySanitizationStrategy,
 )
 from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
+from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from qq_mcp_server import __version__
@@ -57,6 +60,40 @@ _DESTRUCTIVE = {
 _OAUTH_STORAGE_SCHEMA = "v2"
 
 
+class _CanonicalResourceGoogleProvider(GoogleProvider):
+    """Use one OAuth audience for the admin and all per-group MCP endpoints."""
+
+    @override
+    def _get_resource_url(self, path: str | None = None) -> AnyHttpUrl:
+        assert self.base_url is not None
+        return AnyHttpUrl(f"{str(self.base_url).rstrip('/')}/mcp")
+
+    async def _resource_metadata_alias(self, _: Request) -> JSONResponse:
+        assert self._resource_url is not None
+        assert self.issuer_url is not None
+        return JSONResponse(
+            {
+                "resource": str(self._resource_url),
+                "authorization_servers": [str(self.issuer_url)],
+                "scopes_supported": self.required_scopes,
+                "bearer_methods_supported": ["header"],
+            }
+        )
+
+    @override
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        routes = super().get_routes(mcp_path)
+        if mcp_path and mcp_path != "/mcp":
+            routes.append(
+                Route(
+                    f"/.well-known/oauth-protected-resource/{mcp_path.lstrip('/')}",
+                    endpoint=self._resource_metadata_alias,
+                    methods=["GET", "OPTIONS"],
+                )
+            )
+        return routes
+
+
 def _required_secret(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -71,7 +108,7 @@ def _prepare_oauth_storage_path(config: AppConfig) -> Path:
     return storage_path
 
 
-def _auth_provider(config: AppConfig) -> GoogleProvider | None:
+def _auth_provider(config: AppConfig) -> _CanonicalResourceGoogleProvider | None:
     if config.public_url is None:
         return None
     oauth_storage_path = _prepare_oauth_storage_path(config)
@@ -88,7 +125,7 @@ def _auth_provider(config: AppConfig) -> GoogleProvider | None:
         salt="qq_mcp_server_oauth_v2",
         raise_on_decryption_error=False,
     )
-    return GoogleProvider(
+    return _CanonicalResourceGoogleProvider(
         client_id=_required_secret("GOOGLE_OAUTH_CLIENT_ID"),
         client_secret=_required_secret("GOOGLE_OAUTH_CLIENT_SECRET"),
         base_url=config.public_url,

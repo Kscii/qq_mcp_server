@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from test_cards import make_card
 
 from qq_mcp_server.cards import CharacterCardService
@@ -137,3 +139,32 @@ async def test_admin_and_dynamic_group_http_endpoints_initialize(config: AppConf
     assert '\\"qq_group_id\\":\\"3\\"' not in first_status.text
     assert '\\"qq_group_id\\":\\"3\\"' in second_status.text
     assert '\\"qq_group_id\\":\\"2\\"' not in second_status.text
+
+
+async def test_oauth_metadata_aliases_share_one_canonical_resource(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-secret")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "jwt-signing-key-for-tests")
+    monkeypatch.setenv("MCP_STORAGE_ENCRYPTION_KEY", "storage-encryption-key-for-tests")
+    public_config = replace(
+        config,
+        public_url="https://mcp.example.com",
+        allowed_google_emails=("keeper@example.com",),
+    )
+    store, _, _, app = services(public_config)
+    group = store.whitelist_group("2", "测试群")
+    paths = [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-protected-resource/mcp/admin",
+        f"/.well-known/oauth-protected-resource/mcp/groups/{group['group_key']}",
+    ]
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = [await client.get(path) for path in paths]
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+    assert {response.json()["resource"] for response in responses} == {
+        "https://mcp.example.com/mcp"
+    }
