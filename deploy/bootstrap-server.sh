@@ -15,7 +15,8 @@ sudo usermod -aG docker "$(id -un)"
 sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" /opt/qq_mcp_server
 sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" \
     /var/lib/qq_mcp_server \
-    /var/lib/qq_mcp_server/groups \
+    /var/lib/qq_mcp_server/cards \
+    /var/lib/qq_mcp_server/rules-src \
     /var/lib/qq_mcp_server/oauth \
     /var/lib/qq_mcp_server/napcat/config \
     /var/lib/qq_mcp_server/napcat/qq \

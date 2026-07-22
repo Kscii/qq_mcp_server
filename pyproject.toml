@@ -4,14 +4,14 @@ build-backend = "uv_build"
 
 [project]
 name = "qq_mcp_server"
-version = "0.1.0"
-description = "只读同步 QQ 群文字消息并通过纯文本和 MCP 提供查询"
+version = "0.2.0"
+description = "面向 COC 跑团的多群只读 QQ 同步与隔离 MCP 服务"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "kscii", email = "xuejian-fang@outlook.com" }]
-keywords = ["qq", "mcp", "onebot", "napcat"]
+keywords = ["qq", "mcp", "onebot", "napcat", "trpg", "coc"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -24,7 +24,14 @@ classifiers = [
 dependencies = [
   "fastmcp>=3.1,<4",
   "httpx>=0.28,<1",
+  "openpyxl>=3.1,<4",
+  "pdfplumber>=0.11,<1",
+  "py-key-value-aio[filetree]>=0.4.5,<1",
+  "pydantic>=2.11,<3",
+  "python-multipart>=0.0.20,<1",
+  "starlette>=1,<2",
   "tzdata>=2026.1",
+  "uvicorn>=0.35,<1",
 ]
 
 [project.scripts]
@@ -37,6 +44,7 @@ dev = [
   "pytest-asyncio>=1.2,<2",
   "pytest-cov>=7,<8",
   "ruff>=0.14,<1",
+  "types-openpyxl>=3.1,<4",
 ]
 
 [tool.uv.build-backend]
@@ -54,6 +62,12 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/qq_mcp_server/ai_instructions.py" = ["E501"]
+"src/qq_mcp_server/mcp_server.py" = ["E501"]
+"src/qq_mcp_server/store.py" = ["E501"]
+"src/qq_mcp_server/web.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

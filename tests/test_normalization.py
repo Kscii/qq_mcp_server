@@ -30,19 +30,20 @@ def test_keeps_text_sender_reply_and_drops_media_url() -> None:
     assert "secret.invalid" not in repr(message)
 
 
-def test_discards_media_only_message() -> None:
-    assert (
-        normalize_message(
-            {
-                "group_id": 2,
-                "message_id": 10,
-                "user_id": 3,
-                "message": [{"type": "image", "data": {"url": "secret"}}],
-            },
-            expected_group_id="2",
-        )
-        is None
+def test_marks_media_only_message_without_preserving_url() -> None:
+    message = normalize_message(
+        {
+            "group_id": 2,
+            "message_id": 10,
+            "user_id": 3,
+            "message": [{"type": "image", "data": {"url": "secret"}}],
+        },
+        expected_group_id="2",
     )
+    assert message is not None
+    assert message.plain_text == "[未读取的媒体消息]"
+    assert message.contains_unsupported_media is True
+    assert "secret" not in repr(message)
 
 
 def test_rejects_other_group() -> None:

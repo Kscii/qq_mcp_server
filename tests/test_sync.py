@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from qq_mcp_server.config import AppConfig
-from qq_mcp_server.exporter import TextExporter
+from qq_mcp_server.models import GroupTarget
 from qq_mcp_server.store import MessageStore
 from qq_mcp_server.sync import AccountMismatchError, SyncService
 
@@ -53,29 +53,27 @@ class FakeClient:
 
 def service(config: AppConfig, client: FakeClient) -> SyncService:
     store = MessageStore(config.database_path)
-    exporter = TextExporter(
-        store,
-        group_id=config.group_id,
-        group_name=config.group_name,
-        path=config.export_path,
-        timezone=config.timezone,
-    )
-    return SyncService(config, client, store, exporter)  # type: ignore[arg-type]
+    group = store.whitelist_group("2", "测试群")
+    target = GroupTarget(str(group["group_key"]), "2", "测试群")
+    return SyncService(config, target, client, store)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
-async def test_import_all_handles_inclusive_cursor_and_exports(config: AppConfig) -> None:
+async def test_recent_first_then_full_history_backfill(config: AppConfig) -> None:
     client = FakeClient(
         {None: [raw(5), raw(4), raw(3)], "3": [raw(3), raw(2), raw(1)], "1": [raw(1)]}
     )
     sync = service(config, client)
+    recent = await sync.sync_recent()
+    assert recent.inserted == 3
+    assert sync.store.state("2")["recent_ready"] is True
+    assert sync.store.state("2")["initial_import_complete"] is False
+
     result = await sync.import_all()
-    assert result.received == 7
-    assert result.inserted == 5
+    assert result.inserted == 2
     assert result.complete is True
-    assert client.calls == [None, "3", "1"]
     assert sync.store.state("2")["message_count"] == 5
-    assert "消息-5" in config.export_path.read_text(encoding="utf-8")
+    assert sync.store.state("2")["initial_import_complete"] is True
 
 
 @pytest.mark.asyncio

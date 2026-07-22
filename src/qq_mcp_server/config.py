@@ -14,17 +14,19 @@ class ConfigError(ValueError):
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     account_id: str
-    group_id: str
-    group_name: str
     onebot_url: str
     poll_interval_seconds: float
+    registry_refresh_seconds: float
+    sync_concurrency: int
     page_size: int
     request_timeout_seconds: float
     history_timeout_seconds: float
     history_since: str | None
     database_path: Path
-    export_path: Path
+    card_storage_dir: Path
+    rules_database_path: Path
     timezone: str
+    upload_token_ttl_seconds: int
     host: str
     port: int
     public_url: str | None
@@ -103,7 +105,6 @@ def load_config(path: Path) -> AppConfig:
     base = path.parent
 
     account_id = _require_digits(_env("QQ_ACCOUNT_ID", qq.get("account_id")), "qq.account_id")
-    group_id = _require_digits(_env("QQ_GROUP_ID", qq.get("group_id")), "qq.group_id")
     onebot_url = str(_env("ONEBOT_URL", qq.get("onebot_url", "http://127.0.0.1:3000")))
     parsed = urlsplit(onebot_url)
     if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
@@ -125,15 +126,16 @@ def load_config(path: Path) -> AppConfig:
         if not normalized_emails:
             raise ConfigError("配置公网 MCP 时必须设置 access.allowed_google_emails")
 
-    group_name = str(_env("QQ_GROUP_NAME", qq.get("group_name") or group_id)).strip()
     return AppConfig(
         account_id=account_id,
-        group_id=group_id,
-        group_name=group_name,
         onebot_url=onebot_url.rstrip("/"),
         poll_interval_seconds=_number(
             qq.get("poll_interval_seconds", 15), "qq.poll_interval_seconds", 5, 300
         ),
+        registry_refresh_seconds=_number(
+            qq.get("registry_refresh_seconds", 5), "qq.registry_refresh_seconds", 1, 60
+        ),
+        sync_concurrency=_integer(qq.get("sync_concurrency", 3), "qq.sync_concurrency", 1, 16),
         page_size=_integer(qq.get("page_size", 100), "qq.page_size", 1, 500),
         request_timeout_seconds=_number(
             qq.get("request_timeout_seconds", 20), "qq.request_timeout_seconds", 1, 120
@@ -143,16 +145,27 @@ def load_config(path: Path) -> AppConfig:
         ),
         history_since=_text(qq.get("history_since"), "qq.history_since", optional=True),
         database_path=_path(
-            _env("DATABASE_PATH", storage.get("database", "data/messages.sqlite3")),
+            _env("DATABASE_PATH", storage.get("database", "data/trpg.sqlite3")),
             "storage.database",
             base,
         ),
-        export_path=_path(
-            _env("EXPORT_PATH", storage.get("export", f"data/groups/{group_id}.txt")),
-            "storage.export",
+        card_storage_dir=_path(
+            _env("CARD_STORAGE_DIR", storage.get("cards", "data/cards")),
+            "storage.cards",
+            base,
+        ),
+        rules_database_path=_path(
+            _env("RULES_DATABASE_PATH", storage.get("rules", "data/rules.sqlite3")),
+            "storage.rules",
             base,
         ),
         timezone=str(storage.get("timezone") or "Asia/Shanghai"),
+        upload_token_ttl_seconds=_integer(
+            server.get("upload_token_ttl_seconds", 600),
+            "server.upload_token_ttl_seconds",
+            60,
+            3600,
+        ),
         host=str(server.get("host") or "127.0.0.1"),
         port=_integer(_env("PORT", server.get("port", 8000)), "server.port", 1, 65535),
         public_url=public_url,
@@ -165,31 +178,31 @@ def load_config(path: Path) -> AppConfig:
     )
 
 
-def default_config_text(*, account_id: str, group_id: str, group_name: str = "") -> str:
-    safe_group_name = group_name.replace('"', "'") or group_id
-    return f'''# qq_mcp_server 只读取这里明确指定的一个群。
+def default_config_text(*, account_id: str) -> str:
+    return f'''# 群白名单在管理 MCP 发起的极简网页中维护，不在这里填写群号。
 [qq]
 account_id = "{account_id}"
-group_id = "{group_id}"
-group_name = "{safe_group_name}"
 onebot_url = "http://127.0.0.1:3000"
 poll_interval_seconds = 15
+registry_refresh_seconds = 5
+sync_concurrency = 3
 page_size = 100
 request_timeout_seconds = 20
 history_timeout_seconds = 90
-# 留空表示导入 NapCat 可获取的全部历史；也可填写 ISO 8601 时间。
+# 留空表示后台回填 NapCat 可获取的全部历史。
 # history_since = "2026-01-01T00:00:00+08:00"
 
 [storage]
-database = "data/messages.sqlite3"
-export = "data/groups/{group_id}.txt"
+database = "data/trpg.sqlite3"
+cards = "data/cards"
+rules = "data/rules.sqlite3"
 timezone = "Asia/Shanghai"
 oauth = "data/oauth"
 
 [server]
 host = "127.0.0.1"
 port = 8000
-# 配置域名后取消注释；公网模式强制启用 Google OAuth。
+upload_token_ttl_seconds = 600
 # public_url = "https://qq-mcp.example.com"
 
 [access]
