@@ -14,7 +14,15 @@ class OneBotError(RuntimeError):
 class OneBotClient:
     """最小只读 OneBot 11 客户端；不存在发送动作或任意动作入口。"""
 
-    _ALLOWED_ACTIONS = frozenset({"get_login_info", "get_group_info", "get_group_msg_history"})
+    _ALLOWED_ACTIONS = frozenset(
+        {
+            "get_login_info",
+            "get_group_info",
+            "get_group_list",
+            "get_group_member_list",
+            "get_group_msg_history",
+        }
+    )
 
     def __init__(
         self,
@@ -85,6 +93,52 @@ class OneBotClient:
         if str(data.get("group_id") or "") != group_id:
             raise OneBotError("get_group_info 返回了非目标群")
         return data
+
+    async def get_group_list(self) -> list[dict[str, Any]]:
+        data = await self._action("get_group_list", {"no_cache": False})
+        if not isinstance(data, list):
+            raise OneBotError("get_group_list 返回格式错误")
+        result: list[dict[str, Any]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            group_id = str(item.get("group_id") or "")
+            if group_id.isdigit():
+                result.append(
+                    {
+                        "group_id": group_id,
+                        "group_name": str(item.get("group_name") or group_id),
+                        "member_count": int(item.get("member_count") or 0),
+                        "max_member_count": int(item.get("max_member_count") or 0),
+                    }
+                )
+        return result
+
+    async def get_group_member_list(self, group_id: str) -> list[dict[str, Any]]:
+        data = await self._action(
+            "get_group_member_list", {"group_id": group_id, "no_cache": False}
+        )
+        if not isinstance(data, list):
+            raise OneBotError("get_group_member_list 返回格式错误")
+        result: list[dict[str, Any]] = []
+        for item in data:
+            if not isinstance(item, dict) or str(item.get("group_id") or group_id) != group_id:
+                continue
+            user_id = str(item.get("user_id") or "")
+            if not user_id.isdigit():
+                continue
+            nickname = str(item.get("nickname") or "")
+            card = str(item.get("card") or "")
+            result.append(
+                {
+                    "qq_user_id": user_id,
+                    "display_name": card or nickname or user_id,
+                    "card": card,
+                    "nickname": nickname,
+                    "onebot_role": str(item.get("role") or "member"),
+                }
+            )
+        return result
 
     async def get_group_history(
         self, group_id: str, count: int, *, message_seq: str | None = None

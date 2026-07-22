@@ -45,7 +45,10 @@ def normalize_message(raw: dict[str, Any], *, expected_group_id: str) -> ChatMes
 
     plain_text = "".join(text_parts)
     if not plain_text.strip():
-        return None
+        if unsupported:
+            plain_text = "[未读取的媒体消息]"
+        else:
+            return None
 
     raw_sender = raw.get("sender")
     sender: dict[str, Any] = raw_sender if isinstance(raw_sender, dict) else {}

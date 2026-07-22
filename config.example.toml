@@ -1,23 +1,26 @@
+# 群白名单由管理 MCP 签发的极简网页维护；不要在这里填写群号或模组。
 [qq]
 account_id = "123456789"
-group_id = "987654321"
-group_name = "示例群"
 onebot_url = "http://127.0.0.1:3000"
 poll_interval_seconds = 15
+registry_refresh_seconds = 5
+sync_concurrency = 3
 page_size = 100
 request_timeout_seconds = 20
 history_timeout_seconds = 90
 # history_since = "2026-01-01T00:00:00+08:00"
 
 [storage]
-database = "data/messages.sqlite3"
-export = "data/groups/987654321.txt"
+database = "data/trpg.sqlite3"
+cards = "data/cards"
+rules = "data/rules.sqlite3"
 timezone = "Asia/Shanghai"
 oauth = "data/oauth"
 
 [server]
 host = "127.0.0.1"
 port = 8000
+upload_token_ttl_seconds = 600
 # public_url = "https://qq-mcp.example.com"
 
 [access]

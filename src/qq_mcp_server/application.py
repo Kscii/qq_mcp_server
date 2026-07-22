@@ -4,58 +4,63 @@ import asyncio
 import logging
 import os
 
+import uvicorn
+
+from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig, ConfigError
-from qq_mcp_server.exporter import TextExporter
-from qq_mcp_server.mcp_server import create_mcp
+from qq_mcp_server.mcp_server import create_http_app, create_mcp_servers
 from qq_mcp_server.onebot import OneBotClient
+from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.store import MessageStore
-from qq_mcp_server.sync import SyncService
+from qq_mcp_server.sync import MultiGroupSyncManager
 
 
 def build_services(
     config: AppConfig,
-) -> tuple[OneBotClient, MessageStore, TextExporter, SyncService]:
+) -> tuple[
+    OneBotClient,
+    MessageStore,
+    MultiGroupSyncManager,
+    RuleIndex,
+    CharacterCardService,
+]:
     token = os.environ.get("ONEBOT_ACCESS_TOKEN", "").strip()
     if not token:
         raise ConfigError("缺少环境变量 ONEBOT_ACCESS_TOKEN")
     store = MessageStore(config.database_path)
-    exporter = TextExporter(
-        store,
-        group_id=config.group_id,
-        group_name=config.group_name,
-        path=config.export_path,
-        timezone=config.timezone,
-    )
     client = OneBotClient(
         config.onebot_url,
         token,
         request_timeout=config.request_timeout_seconds,
         history_timeout=config.history_timeout_seconds,
     )
-    return client, store, exporter, SyncService(config, client, store, exporter)
+    manager = MultiGroupSyncManager(config, client, store)
+    rules = RuleIndex(config.rules_database_path)
+    cards = CharacterCardService(store, config.card_storage_dir)
+    return client, store, manager, rules, cards
 
 
 async def run_server(config: AppConfig) -> None:
-    client, store, _, sync = build_services(config)
-    mcp = create_mcp(config, store)
+    client, store, manager, rules, cards = build_services(config)
+    admin, group = create_mcp_servers(config, store, client, rules, cards)
+    app = create_http_app(admin, group, store)
     logging.getLogger(__name__).info(
-        "MCP 监听 %s:%d/mcp；目标群 %s",
+        "Admin MCP: %s:%d/mcp/admin；每群 MCP: /mcp/groups/{group_key}",
         config.host,
         config.port,
-        config.group_id,
+    )
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=config.host,
+            port=config.port,
+            log_level="info",
+            lifespan="on",
+        )
     )
     try:
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(sync.run_forever())
-            tasks.create_task(
-                mcp.run_http_async(
-                    host=config.host,
-                    port=config.port,
-                    path="/mcp",
-                    show_banner=False,
-                    log_level="info",
-                    stateless_http=True,
-                )
-            )
+            tasks.create_task(manager.run_forever())
+            tasks.create_task(server.serve())
     finally:
         await client.close()
