@@ -9,7 +9,7 @@ from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from typing import Any, cast, override
+from typing import Annotated, Any, cast, override
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -35,7 +35,7 @@ from mcp.server.auth.provider import (
     TokenError,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, Field
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -76,6 +76,15 @@ _DESTRUCTIVE = {
 }
 _OAUTH_STORAGE_SCHEMA = "v2"
 _RESOURCE_BINDINGS_COLLECTION = "qq-mcp-resource-bindings-v1"
+
+_GroupKey = Annotated[
+    str,
+    Field(description="由 admin.list_groups 返回的固定群标识；不要使用群名称或 QQ 群号代替。"),
+]
+_ExpectedVersion = Annotated[
+    int,
+    Field(description="最近一次读取到的群版本号；写入前用于检测并发修改。"),
+]
 
 
 class _DynamicResourceGoogleProvider(GoogleProvider):
@@ -561,8 +570,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.open_group_whitelist",
         description=(
-            "Use this when the user needs to add or remove QQ groups from the collection whitelist. "
-            "Returns a short-lived minimal web page; do not use for enable/disable."
+            "当用户需要把 QQ 群加入或移出消息采集白名单时使用。"
+            "返回短期有效的最小网页；启用或停用跑团时不要调用本工具。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -584,8 +593,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.list_groups",
         description=(
-            "Use this first to list every whitelisted QQ group, fixed group App URL, setup readiness, "
-            "sync progress and roleplay enabled state."
+            "需要了解可管理的群时优先调用。列出全部白名单群、每群固定 MCP 地址、"
+            "配置完整度、同步进度和跑团启用状态。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -610,14 +619,12 @@ def create_mcp_servers(
 
     @admin.tool(
         name="admin.get_group_setup",
-        description=(
-            "Use this to show the user one complete but concise setup checklist for a selected group."
-        ),
+        description="需要检查某个群缺少哪些配置时使用，返回完整但精简的设置清单。",
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
-    async def get_group_setup(group_key: str) -> dict[str, Any]:
+    async def get_group_setup(group_key: _GroupKey) -> dict[str, Any]:
         group = store.get_group(group_key)
         return {
             "group": _group_meta(group),
@@ -629,15 +636,19 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.list_group_members",
         description=(
-            "Use this before binding the current player, KP or dice bots. Returns stable QQ IDs and "
-            "display names from OneBot; never bind by display name alone."
+            "绑定当前玩家、KP 或骰娘前调用。返回 OneBot 提供的稳定 QQ 号和显示名；"
+            "不要只凭显示名绑定。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
     async def list_group_members(
-        group_key: str, query: str | None = None, limit: int = 50
+        group_key: _GroupKey,
+        query: Annotated[
+            str | None, Field(description="可选筛选词，匹配成员 QQ 号或显示名。")
+        ] = None,
+        limit: Annotated[int, Field(description="最多返回的成员数，范围 1 到 200。")] = 50,
     ) -> dict[str, Any]:
         if not 1 <= limit <= 200:
             raise ValueError("limit 必须在 1 到 200 之间")
@@ -660,19 +671,24 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.update_group_profile",
         description=(
-            "Use only after a direct ChatGPT user request to set the permanent module title, display "
-            "label or a short per-group roleplay style preference."
+            "仅在用户直接要求后，用于设置长期保存的模组标题、群显示标签或简短的本群扮演风格偏好。"
         ),
         annotations=_WRITE,
         auth=auth_check,
         run_in_thread=False,
     )
     async def update_group_profile(
-        group_key: str,
-        expected_version: int,
-        module_title: str | None = None,
-        display_label: str | None = None,
-        roleplay_guidance: str | None = None,
+        group_key: _GroupKey,
+        expected_version: _ExpectedVersion,
+        module_title: Annotated[
+            str | None, Field(description="可选的新模组标题；省略则保持不变。")
+        ] = None,
+        display_label: Annotated[
+            str | None, Field(description="可选的群显示标签；省略则保持不变。")
+        ] = None,
+        roleplay_guidance: Annotated[
+            str | None, Field(description="可选的本群简短扮演风格偏好；省略则保持不变。")
+        ] = None,
     ) -> dict[str, Any]:
         try:
             group = store.update_group_profile(
@@ -695,19 +711,25 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.set_member_roles",
         description=(
-            "Use after list_group_members and a direct user choice. Bind exactly one player QQ ID and "
-            "optional KP/dice-bot QQ ID lists for this fixed group."
+            "调用 admin.list_group_members 并取得用户明确选择后使用。为固定群绑定恰好一名"
+            "当前玩家，以及可选的 KP 和骰娘 QQ 号列表。"
         ),
         annotations=_WRITE,
         auth=auth_check,
         run_in_thread=False,
     )
     async def set_member_roles(
-        group_key: str,
-        expected_version: int,
-        player_qq_user_id: str,
-        kp_qq_user_ids: list[str] | None = None,
-        dice_bot_qq_user_ids: list[str] | None = None,
+        group_key: _GroupKey,
+        expected_version: _ExpectedVersion,
+        player_qq_user_id: Annotated[
+            str, Field(description="当前玩家的稳定 QQ 号，必须来自本群成员列表。")
+        ],
+        kp_qq_user_ids: Annotated[
+            list[str] | None, Field(description="可选的 KP QQ 号列表，必须来自本群成员列表。")
+        ] = None,
+        dice_bot_qq_user_ids: Annotated[
+            list[str] | None, Field(description="可选的骰娘 QQ 号列表，必须来自本群成员列表。")
+        ] = None,
     ) -> dict[str, Any]:
         group = store.get_group(group_key)
         members = await client.get_group_member_list(str(group["qq_group_id"]))
@@ -736,15 +758,17 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.set_group_enabled",
         description=(
-            "Use only after a direct user request to enable or disable roleplay tools. Disabling does "
-            "not stop message synchronization while the group remains whitelisted."
+            "仅在用户直接要求后启用或停用本群跑团工具。只要群仍在白名单内，"
+            "停用跑团也不会停止消息同步。"
         ),
         annotations=_WRITE,
         auth=auth_check,
         run_in_thread=False,
     )
     async def set_group_enabled(
-        group_key: str, expected_version: int, enabled: bool
+        group_key: _GroupKey,
+        expected_version: _ExpectedVersion,
+        enabled: Annotated[bool, Field(description="true 表示启用跑团，false 表示停用。")],
     ) -> dict[str, Any]:
         group = store.get_group(group_key)
         if enabled:
@@ -787,8 +811,7 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.get_status",
         description=(
-            "Use this for setup, diagnostics or a concise complete readiness checklist for this fixed "
-            "group. Available even while roleplay is disabled."
+            "需要设置、诊断或查看本固定群的精简完整就绪清单时使用。即使跑团已停用，本工具仍可调用。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -806,15 +829,18 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.get_roleplay_context",
         description=(
-            "Use this once at the start of a roleplay-reply task. Returns recent messages, sender roles, "
-            "current character, active notes, recent changes and sync health for this fixed group."
+            "每次开始处理跑团回复时调用一次。返回本固定群的近期消息、发送者身份、"
+            "当前人物、有效笔记、近期变更和同步状态。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
     async def get_roleplay_context(
-        since_message_id: str | None = None, limit: int = 30
+        since_message_id: Annotated[
+            str | None, Field(description="可选游标；只读取此消息 ID 之后的上下文。")
+        ] = None,
+        limit: Annotated[int, Field(description="最多返回的消息数，范围 1 到 100。")] = 30,
     ) -> dict[str, Any]:
         group, error = enabled_group()
         if error:
@@ -847,14 +873,19 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.get_character_card",
         description=(
-            "Use this when the user asks to inspect the current character or when full card fields and "
-            "spreadsheet provenance are needed. view is roleplay or full."
+            "用户要求查看当前人物，或任务需要完整人物卡字段及表格来源时使用。"
+            "view 只能是 roleplay 或 full。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
-    async def get_character_card(view: str = "roleplay") -> dict[str, Any]:
+    async def get_character_card(
+        view: Annotated[
+            str,
+            Field(description="roleplay 返回扮演所需字段；full 返回完整人物卡和来源信息。"),
+        ] = "roleplay",
+    ) -> dict[str, Any]:
         if view not in {"roleplay", "full"}:
             raise ValueError("view 必须是 roleplay 或 full")
         group = selected_group()
@@ -874,19 +905,27 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.search_messages",
         description=(
-            "Use this to find older text in this fixed QQ group by substring, stable sender QQ or time. "
-            "Do not use for the normal latest-message flow."
+            "需要按文本片段、稳定发送者 QQ 号或时间查找本固定群的较早消息时使用。"
+            "正常读取最新跑团消息时不要调用。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
     async def search_messages(
-        query: str | None = None,
-        sender_qq_user_id: str | None = None,
-        after: str | None = None,
-        before: str | None = None,
-        limit: int = 20,
+        query: Annotated[
+            str | None, Field(description="可选文本片段，在已同步的纯文本消息中匹配。")
+        ] = None,
+        sender_qq_user_id: Annotated[
+            str | None, Field(description="可选发送者 QQ 号，只能包含数字。")
+        ] = None,
+        after: Annotated[
+            str | None, Field(description="可选起始时间，使用 ISO 8601 格式。")
+        ] = None,
+        before: Annotated[
+            str | None, Field(description="可选结束时间，使用 ISO 8601 格式。")
+        ] = None,
+        limit: Annotated[int, Field(description="最多返回的消息数，范围 1 到 50。")] = 20,
     ) -> dict[str, Any]:
         group, error = enabled_group()
         if error:
@@ -917,14 +956,20 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.search_coc_rules",
         description=(
-            "Use this automatically only when an exact COC mechanism affects a rule answer, check "
-            "suggestion or roleplay option. Do not call for ordinary narrative replies."
+            "仅当准确的 COC 机制会影响规则回答、检定建议或行动选项时自动调用。"
+            "普通叙事回复不要调用。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
-    async def search_coc_rules(query: str, book: str = "all", limit: int = 3) -> dict[str, Any]:
+    async def search_coc_rules(
+        query: Annotated[str, Field(description="要检索的 COC 规则、机制或关键词。")],
+        book: Annotated[
+            str, Field(description="检索范围；all 表示全部已索引规则书，也可指定书名。")
+        ] = "all",
+        limit: Annotated[int, Field(description="最多返回的规则片段数。")] = 3,
+    ) -> dict[str, Any]:
         group = selected_group()
         try:
             results = rules.search(query, book=book, limit=limit)
@@ -939,8 +984,8 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.begin_character_card_upload",
         description=(
-            "Use after a direct ChatGPT user request to upload or replace this group's fixed-template "
-            "XLSX character card. Returns a short-lived preview-and-confirm web link."
+            "仅在用户直接要求上传或替换本群固定模板 XLSX 人物卡后使用。"
+            "返回短期有效的上传、预览和确认网页。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -969,19 +1014,26 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.commit_turn_updates",
         description=(
-            "Use one atomic call for explicit character changes and user-approved structured notes in "
-            "this group. qq_event card changes require source message IDs; important clues require prior user consent."
+            "在一次原子操作中提交本群明确发生的人物变化和经用户同意的结构化笔记。"
+            "来自 QQ 事件的人物卡变化必须附来源消息 ID；记录重要线索前必须先取得用户同意。"
         ),
         annotations=_WRITE,
         auth=auth_check,
         run_in_thread=False,
     )
     async def commit_turn_updates(
-        expected_version: int,
-        origin: str,
-        summary: str,
-        card_operations: list[CardOperation] | None = None,
-        note_operations: list[NoteOperation] | None = None,
+        expected_version: _ExpectedVersion,
+        origin: Annotated[
+            str, Field(description="变更来源；QQ 群事件应使用 qq_event，并附来源消息 ID。")
+        ],
+        summary: Annotated[str, Field(description="便于用户审计的简短中文变更摘要。")],
+        card_operations: Annotated[
+            list[CardOperation] | None, Field(description="可选的人物卡字段修改操作列表。")
+        ] = None,
+        note_operations: Annotated[
+            list[NoteOperation] | None,
+            Field(description="可选的结构化笔记操作列表；重要线索需要用户事先同意。"),
+        ] = None,
     ) -> dict[str, Any]:
         group, error = enabled_group()
         if error:
@@ -1020,14 +1072,17 @@ def create_mcp_servers(
 
     @group_mcp.tool(
         name="trpg.list_changes",
-        description=(
-            "Use this when the user asks what the AI changed or needs an older change_id for a targeted undo."
-        ),
+        description="用户询问 AI 修改了什么，或定向撤销需要较早的 change_id 时使用。",
         annotations=_READ_ONLY,
         auth=auth_check,
         run_in_thread=False,
     )
-    async def list_changes(limit: int = 20, before_change_id: str | None = None) -> dict[str, Any]:
+    async def list_changes(
+        limit: Annotated[int, Field(description="最多返回的变更数，范围 1 到 100。")] = 20,
+        before_change_id: Annotated[
+            str | None, Field(description="可选分页游标，只返回此 change_id 之前的变更。")
+        ] = None,
+    ) -> dict[str, Any]:
         group, error = enabled_group()
         if error:
             return error
@@ -1045,14 +1100,18 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.undo_change",
         description=(
-            "Use only after a direct user request to undo one whole change_id. Refuses unsafe rollback "
-            "when later changes touched the same card fields or notes."
+            "仅在用户直接要求后撤销一个完整的 change_id。若后续变更碰过相同人物卡字段"
+            "或笔记，工具会拒绝不安全的回滚。"
         ),
         annotations=_DESTRUCTIVE,
         auth=auth_check,
         run_in_thread=False,
     )
-    async def undo_change(change_id: str, expected_version: int, reason: str) -> dict[str, Any]:
+    async def undo_change(
+        change_id: Annotated[str, Field(description="要完整撤销的变更 ID。")],
+        expected_version: _ExpectedVersion,
+        reason: Annotated[str, Field(description="用户要求撤销的简短原因，用于审计记录。")],
+    ) -> dict[str, Any]:
         group, error = enabled_group()
         if error:
             return error

@@ -128,6 +128,30 @@ async def test_admin_and_group_apps_are_separate(config: AppConfig) -> None:
     )
 
 
+async def test_all_tool_and_parameter_descriptions_are_chinese(config: AppConfig) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    admin, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    tools = [*(await admin.list_tools()), *(await group_mcp.list_tools())]
+    assert len(tools) == 16
+    for tool in tools:
+        assert tool.description
+        assert any("\u4e00" <= character <= "\u9fff" for character in tool.description)
+        for parameter_name, schema in tool.parameters.get("properties", {}).items():
+            assert schema.get("description"), (
+                f"{tool.name} 的参数 {parameter_name} 缺少面向 AI 的中文说明"
+            )
+            assert any("\u4e00" <= character <= "\u9fff" for character in schema["description"])
+
+
 async def test_disabled_group_reports_action_while_status_still_works(config: AppConfig) -> None:
     store = MessageStore(config.database_path)
     group = store.whitelist_group("2", "测试群")

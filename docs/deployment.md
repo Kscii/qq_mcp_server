@@ -78,6 +78,45 @@ Google OAuth Web Application 回调地址必须精确填写
 配置后，`admin.list_groups` 会返回每个群唯一的
 `https://qq-mcp.example.com/mcp/groups/{group_key}`，把它作为独立 App 连接到对应跑团对话。
 
+## GitHub Actions 部署身份
+
+发布工作流使用 GitHub OIDC 临时扮演部署服务账号，不保存 Google Cloud 长期密钥。首次
+启用自动部署时，用拥有项目 IAM 管理权限、且当前仍能 SSH 到 VM 的管理员执行以下命令。
+先给管理员本人和 GitHub 部署账号配置 OS Login，再切换实例；不要颠倒顺序，否则可能暂时
+失去 SSH 登录能力。
+
+```bash
+PROJECT_ID=project-51b589c7-8d5e-4e78-a10
+ZONE=australia-southeast1-a
+INSTANCE=qq-mcp-server
+ADMIN_EMAIL=你的_Google_账号
+DEPLOY_SA=github-qq-mcp-deployer@project-51b589c7-8d5e-4e78-a10.iam.gserviceaccount.com
+VM_SA=qq-mcp-server-vm@project-51b589c7-8d5e-4e78-a10.iam.gserviceaccount.com
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="user:$ADMIN_EMAIL" --role=roles/compute.osAdminLogin
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="user:$ADMIN_EMAIL" --role=roles/iap.tunnelResourceAccessor
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$DEPLOY_SA" --role=roles/compute.osAdminLogin
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$DEPLOY_SA" --role=roles/iap.tunnelResourceAccessor
+gcloud iam service-accounts add-iam-policy-binding "$VM_SA" \
+  --member="serviceAccount:$DEPLOY_SA" --role=roles/iam.serviceAccountUser
+
+gcloud compute instances add-metadata "$INSTANCE" \
+  --project="$PROJECT_ID" --zone="$ZONE" --metadata=enable-oslogin=TRUE
+gcloud compute ssh "$INSTANCE" \
+  --project="$PROJECT_ID" --zone="$ZONE" --tunnel-through-iap --command=true
+```
+
+项目中还需要允许 IAP 地址段 `35.235.240.0/20` 入站访问 VM 的 TCP 22；若管理员使用
+`--tunnel-through-iap` 已经能连接，则这条防火墙规则通常已经存在。部署账号原有的
+`roles/compute.viewer` 和 Artifact Registry Writer 仍需保留。`roles/compute.osAdminLogin`
+提供工作流中 `sudo` 所需权限，`roles/iam.serviceAccountUser` 只授予在 VM 所绑定服务账号
+上的使用权。
+
 ## 发布与回滚
 
 推送 `vX.Y.Z` 形式且与 `pyproject.toml` 版本一致的标签后，GitHub Actions 会：
