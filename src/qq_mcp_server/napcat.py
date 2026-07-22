@@ -15,10 +15,12 @@ def _atomic_json(path: Path, value: object) -> None:
     os.replace(temporary, path)
 
 
-def prepare_napcat_config(directory: Path, onebot_token: str) -> None:
+def prepare_napcat_config(directory: Path, onebot_token: str, account_id: str) -> None:
     """生成仅监听回环地址、仅启用 HTTP 的 NapCat 配置。"""
     if not onebot_token:
         raise ValueError("ONEBOT_ACCESS_TOKEN 不能为空")
+    if not account_id.isdigit():
+        raise ValueError("QQ 账号必须只包含数字")
     directory = directory.expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     webui_path = directory / "webui.json"
@@ -33,7 +35,29 @@ def prepare_napcat_config(directory: Path, onebot_token: str) -> None:
                 "loginRate": 3,
             },
         )
+    _enforce_quiet_logs(directory / "napcat.json")
+    _enforce_quiet_logs(directory / f"napcat_{account_id}.json")
     _atomic_json(directory / "onebot11.json", _onebot_config(onebot_token))
+
+
+def _enforce_quiet_logs(path: Path) -> None:
+    value: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            value = loaded
+    value.update(
+        {
+            "fileLog": False,
+            "consoleLog": True,
+            "fileLogLevel": "error",
+            "consoleLogLevel": "error",
+        }
+    )
+    _atomic_json(path, value)
 
 
 def _onebot_config(token: str) -> dict[str, Any]:

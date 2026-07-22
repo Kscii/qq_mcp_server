@@ -23,6 +23,9 @@ qq_mcp_server
 - `mcp_server.py`：最近消息、搜索、同步状态和 OAuth 邮箱白名单。
 - `cli.py`：初始化、单次同步、持续运行、状态和导出。
 
+NapCat 文件日志关闭，控制台仅保留 error 级信息，避免上游默认把
+非目标群的实时事件写入容器日志。
+
 程序只有一个 Python 服务进程。没有 PostgreSQL、Redis、消息队列、WebSocket 或
 后台任务框架。SQLite 每次操作使用短连接和 WAL，因此同步循环与 MCP 查询可以安全
 共享同一数据库文件。

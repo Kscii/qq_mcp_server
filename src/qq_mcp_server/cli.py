@@ -142,7 +142,8 @@ def main() -> None:
             _export(arguments.config)
         elif arguments.command == "prepare-napcat":
             token = os.environ.get("ONEBOT_ACCESS_TOKEN", "").strip()
-            prepare_napcat_config(arguments.directory, token)
+            config = load_config(arguments.config)
+            prepare_napcat_config(arguments.directory, token, config.account_id)
             print(f"✓ 已准备 NapCat 配置：{arguments.directory}")
     except (ConfigError, ValueError) as error:
         _die(str(error))
