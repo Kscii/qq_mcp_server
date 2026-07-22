@@ -41,6 +41,10 @@ def build_services(
 
 
 async def run_server(config: AppConfig) -> None:
+    # Google token validation sends the access token as a tokeninfo query
+    # parameter. httpx's INFO request log includes the full URL, so keep it out
+    # of production logs while retaining warnings and errors.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     client, store, manager, rules, cards = build_services(config)
     admin, group = create_mcp_servers(config, store, client, rules, cards)
     app = create_http_app(admin, group, store)

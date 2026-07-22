@@ -1113,5 +1113,12 @@ def create_http_app(admin: FastMCP, group: FastMCP, store: MessageStore) -> ASGI
             await stack.enter_async_context(group_app.router.lifespan_context(group_app))
             yield
 
-    app = Starlette(routes=routes, lifespan=lifespan)
+    # The OAuth bearer verifier is app-level middleware. Rebuilding a Starlette
+    # app from routes alone silently drops it, so RequireAuthMiddleware never
+    # sees an authenticated user and rejects every valid token.
+    app = Starlette(
+        routes=routes,
+        middleware=list(admin_app.user_middleware),
+        lifespan=lifespan,
+    )
     return _WhitelistPathGuard(app, store)

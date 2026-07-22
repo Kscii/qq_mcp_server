@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fastmcp.server.auth import AccessToken
 from test_cards import make_card
 
 from qq_mcp_server.cards import CharacterCardService
@@ -168,3 +169,65 @@ async def test_oauth_metadata_uses_each_exact_mcp_resource(
         "https://mcp.example.com/mcp/admin",
         f"https://mcp.example.com/mcp/groups/{group['group_key']}",
     ]
+
+
+async def test_combined_http_app_preserves_bearer_authentication_middleware(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-secret")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "jwt-signing-key-for-tests")
+    monkeypatch.setenv("MCP_STORAGE_ENCRYPTION_KEY", "storage-encryption-key-for-tests")
+    public_config = replace(
+        config,
+        public_url="https://mcp.example.com",
+        allowed_google_emails=("keeper@example.com",),
+    )
+    store = MessageStore(public_config.database_path)
+    onebot = FakeOneBot()
+    cards = CharacterCardService(store, public_config.card_storage_dir)
+    admin, group_mcp = create_mcp_servers(
+        public_config,
+        store,
+        onebot,  # type: ignore[arg-type]
+        RuleIndex(public_config.rules_database_path),
+        cards,
+    )
+    assert admin.auth is not None
+
+    async def verify_token(token: str) -> AccessToken | None:
+        assert token == "valid-test-token"
+        return AccessToken(
+            token=token,
+            client_id="keeper",
+            scopes=["openid", "https://www.googleapis.com/auth/userinfo.email"],
+            claims={"email": "keeper@example.com"},
+        )
+
+    monkeypatch.setattr(admin.auth, "verify_token", verify_token)
+    app = create_http_app(admin, group_mcp, store)
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+    headers = {
+        "authorization": "Bearer valid-test-token",
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+    inner = app.app  # type: ignore[attr-defined]
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        inner.router.lifespan_context(inner),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        response = await client.post("/mcp/admin", json=payload, headers=headers)
+
+    assert response.status_code == 200
+    assert '"name":"TRPG 管理"' in response.text
