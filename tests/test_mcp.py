@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -28,6 +29,13 @@ class FakeOneBot:
                 "onebot_role": "member",
             }
         ]
+
+
+def test_release_deploy_does_not_expand_privileged_glob_as_os_login_user() -> None:
+    workflow = Path(".github/workflows/release.yml").read_text()
+    assert "sudo chmod 700 /opt/qq_mcp_server/*.sh" not in workflow
+    assert "sudo find /opt/qq_mcp_server" in workflow
+    assert "--no-same-owner" in workflow
 
 
 async def test_oauth_provider_accepts_exact_admin_and_group_resources(

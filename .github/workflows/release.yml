@@ -85,4 +85,4 @@ jobs:
           image_ref="${IMAGE}@${DIGEST}"
           gcloud compute ssh "$INSTANCE" --zone "$ZONE" \
             --tunnel-through-iap --quiet \
-            --command="sudo install -d -m 0750 /opt/qq_mcp_server && sudo tar -xzf /tmp/qq-mcp-server-deploy.tar.gz -C /opt/qq_mcp_server --strip-components=1 --exclude='.env' --exclude='deploy.env' && sudo chmod 700 /opt/qq_mcp_server/*.sh && sudo /opt/qq_mcp_server/deploy-image.sh '$image_ref'"
+            --command="sudo install -d -m 0750 /opt/qq_mcp_server && sudo tar -xzf /tmp/qq-mcp-server-deploy.tar.gz -C /opt/qq_mcp_server --strip-components=1 --no-same-owner --exclude='.env' --exclude='deploy.env' && sudo find /opt/qq_mcp_server -maxdepth 1 -type f -name '*.sh' -exec chmod 700 {} + && sudo /opt/qq_mcp_server/deploy-image.sh '$image_ref'"
