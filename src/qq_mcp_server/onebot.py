@@ -95,7 +95,7 @@ class OneBotClient:
         return data
 
     async def get_group_list(self) -> list[dict[str, Any]]:
-        data = await self._action("get_group_list", {"no_cache": False})
+        data = await self._action("get_group_list", {"no_cache": True})
         if not isinstance(data, list):
             raise OneBotError("get_group_list 返回格式错误")
         result: list[dict[str, Any]] = []

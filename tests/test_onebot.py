@@ -45,6 +45,7 @@ async def test_private_action_guard_rejects_send() -> None:
 async def test_group_registry_actions_are_normalized_and_read_only() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/get_group_list":
+            assert json.loads(request.content) == {"no_cache": True}
             return httpx.Response(
                 200,
                 json={
