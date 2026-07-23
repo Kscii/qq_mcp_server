@@ -37,7 +37,10 @@ def prepare_napcat_config(directory: Path, onebot_token: str, account_id: str) -
         )
     _enforce_quiet_logs(directory / "napcat.json")
     _enforce_quiet_logs(directory / f"napcat_{account_id}.json")
-    _atomic_json(directory / "onebot11.json", _onebot_config(onebot_token))
+    onebot = _onebot_config(onebot_token)
+    _atomic_json(directory / "onebot11.json", onebot)
+    # NapCat 登录后优先读取账号专属文件；只更新通用文件不会改变已登录账号的网络配置。
+    _atomic_json(directory / f"onebot11_{account_id}.json", onebot)
 
 
 def _enforce_quiet_logs(path: Path) -> None:

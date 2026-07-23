@@ -11,6 +11,8 @@ def test_napcat_config_is_loopback_http_sse_only_and_has_no_send_action(
 ) -> None:
     prepare_napcat_config(tmp_path, "secret-token", "123456789")
     onebot = json.loads((tmp_path / "onebot11.json").read_text(encoding="utf-8"))
+    account_onebot = json.loads((tmp_path / "onebot11_123456789.json").read_text(encoding="utf-8"))
+    assert account_onebot == onebot
     network = onebot["network"]
     assert network["websocketServers"] == []
     assert network["httpClients"] == []
@@ -59,6 +61,8 @@ def test_prepare_keeps_webui_login_token_but_rotates_onebot_token(tmp_path: Path
     assert (tmp_path / "webui.json").read_text(encoding="utf-8") == first_webui
     onebot = json.loads((tmp_path / "onebot11.json").read_text(encoding="utf-8"))
     assert onebot["network"]["httpServers"][0]["token"] == "second"
+    account_onebot = json.loads((tmp_path / "onebot11_123456789.json").read_text(encoding="utf-8"))
+    assert account_onebot == onebot
     updated = json.loads(account_config.read_text(encoding="utf-8"))
     assert updated["autoTimeSync"] is True
     assert updated["consoleLogLevel"] == "error"
