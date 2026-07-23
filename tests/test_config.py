@@ -37,3 +37,14 @@ def test_onebot_must_remain_loopback(tmp_path: Path) -> None:
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigError, match="回环"):
         load_config(path)
+
+
+def test_napcat_webui_must_be_private_tailscale_https(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    text = default_config_text(account_id="123").replace(
+        '# napcat_webui_url = "https://qq-mcp-server.example-tailnet.ts.net:8443/webui"',
+        'napcat_webui_url = "https://public.example.com/webui"',
+    )
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match="ts.net"):
+        load_config(path)

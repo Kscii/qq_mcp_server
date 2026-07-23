@@ -12,8 +12,11 @@ def config(tmp_path: Path) -> AppConfig:
     return AppConfig(
         account_id="1",
         onebot_url="http://127.0.0.1:3000",
+        onebot_sse_url="http://127.0.0.1:3001/_events",
         poll_interval_seconds=15,
         registry_refresh_seconds=1,
+        group_discovery_interval_seconds=60,
+        context_freshness_seconds=60,
         sync_concurrency=2,
         page_size=3,
         request_timeout_seconds=20,
@@ -27,6 +30,9 @@ def config(tmp_path: Path) -> AppConfig:
         host="127.0.0.1",
         port=8000,
         public_url=None,
+        napcat_webui_url=None,
+        napcat_webui_config_path=tmp_path / "napcat" / "config" / "webui.json",
+        napcat_control_dir=tmp_path / "control",
         allowed_google_emails=(),
         oauth_storage_dir=tmp_path / "oauth",
     )

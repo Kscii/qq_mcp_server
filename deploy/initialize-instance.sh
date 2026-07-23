@@ -29,6 +29,8 @@ printf '%s\n' \
     "CARD_STORAGE_DIR=/data/cards" \
     "RULES_DATABASE_PATH=/data/rules.sqlite3" \
     "OAUTH_STORAGE_DIR=/data/oauth" \
+    "NAPCAT_WEBUI_CONFIG_PATH=/data/napcat/config/webui.json" \
+    "NAPCAT_CONTROL_DIR=/data/control" \
     "ONEBOT_ACCESS_TOKEN=$token" >.env
 unset token
 printf 'APP_IMAGE=%s\n' "$2" >deploy.env

@@ -6,6 +6,7 @@
 |---|---|---|
 | QQ 账号、OneBot 回环地址、数据库/卡片/规则路径、OAuth、公网地址、同步参数 | TOML/环境变量，部署时很少改 | 服务基础设施和秘密不能交给群聊决定 |
 | QQ 群加入/移出采集白名单 | 管理 MCP 签发的一次性网页 | 这是唯一需要人工确认群列表的配置 UI |
+| QQ 登录与 NapCat 恢复 | 管理 MCP 签发的一次性确认页 | 长期 Token 不进入 AI；重启还需要人工确认 |
 | 模组名、显示名、短角色偏好 | `admin.update_group_profile` | AI 可先读版本并可靠地结构化更新 |
 | 玩家、KP、骰娘 QQ 号 | `admin.list_group_members` 后调用 `admin.set_member_roles` | 绑定稳定 QQ 号，不绑定易变昵称 |
 | 跑团启用/停用 | `admin.set_group_enabled` | 只允许白名单群；停用不停止消息同步 |
@@ -40,8 +41,11 @@ qq_mcp_server prepare-napcat DIRECTORY
 
 - `account_id`：NapCat 登录 QQ；可用 `QQ_ACCOUNT_ID` 覆盖。
 - `onebot_url`：只允许 `127.0.0.1`、`localhost` 或 `::1` 的明文 HTTP；可用 `ONEBOT_URL` 覆盖。
+- `onebot_sse_url`：只允许回环地址上的 `/_events`；默认 `127.0.0.1:3001`。
 - `poll_interval_seconds`：每群最近消息轮询周期，5–300 秒。
 - `registry_refresh_seconds`：白名单任务刷新周期，1–60 秒。
+- `group_discovery_interval_seconds`：主动强制刷新群列表的周期，默认 60 秒。
+- `context_freshness_seconds`：跑团上下文允许的最大成功轮询年龄，默认 60 秒。
 - `sync_concurrency`：所有群共享的 OneBot 并发上限，1–16。
 - `page_size`：历史分页大小，1–500。
 - `request_timeout_seconds` / `history_timeout_seconds`：普通/历史接口超时。
@@ -62,6 +66,11 @@ qq_mcp_server prepare-napcat DIRECTORY
 - `host`、`port` / `PORT`：监听地址和端口。
 - `public_url` / `PUBLIC_URL`：公网 HTTPS 根地址；设置后强制启用 OAuth 和邮箱白名单。
 - `upload_token_ttl_seconds`：一次性网页链接时效，60–3600 秒，默认 600。
+- `napcat_webui_url` / `NAPCAT_WEBUI_URL`：严格限制为
+  `https://<设备>.ts.net:8443/webui` 的 Tailscale 私有地址。
+- `napcat_webui_config` / `NAPCAT_WEBUI_CONFIG_PATH`：只在跳转确认时读取当前
+  `webui.json` Token。
+- `napcat_control_dir` / `NAPCAT_CONTROL_DIR`：应用与主机恢复助手之间的固定请求目录。
 
 `[access].allowed_google_emails` 可用单个 `ALLOWED_GOOGLE_EMAIL` 覆盖。公网模式还必须设置
 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`、`MCP_JWT_SIGNING_KEY` 和
@@ -86,6 +95,10 @@ v0.2 不迁移旧版 qq_mcp_server 或 Dice Echo 数据，也不迁移旧人物�
 ## 管理 MCP 工具
 
 - `admin.open_group_whitelist()`：签发一次性白名单页。
+- `admin.get_napcat_status()`：诊断登录、OneBot、SSE、群注册表和逐群同步新鲜度。
+- `admin.probe_group(group_id)`：列表缺失时直接验证当前 QQ 是否能访问指定群。
+- `admin.open_napcat_webui()`：签发不向 AI 暴露长期 Token 的私有面板入口。
+- `admin.open_napcat_recovery()`：取得用户明确同意后签发重启二次确认页。
 - `admin.list_groups()`：群、固定 URL、版本、同步和下一步。
 - `admin.get_group_setup(group_key)`：单群完整准备清单。
 - `admin.list_group_members(group_key, query?, limit)`：读取稳定 QQ 号。

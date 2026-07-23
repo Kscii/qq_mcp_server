@@ -86,8 +86,8 @@ class OneBotClient:
             raise OneBotError("get_login_info 返回格式错误")
         return data
 
-    async def get_group_info(self, group_id: str) -> dict[str, Any]:
-        data = await self._action("get_group_info", {"group_id": group_id, "no_cache": False})
+    async def get_group_info(self, group_id: str, *, no_cache: bool = False) -> dict[str, Any]:
+        data = await self._action("get_group_info", {"group_id": group_id, "no_cache": no_cache})
         if not isinstance(data, dict):
             raise OneBotError("get_group_info 返回格式错误")
         if str(data.get("group_id") or "") != group_id:
@@ -114,9 +114,11 @@ class OneBotClient:
                 )
         return result
 
-    async def get_group_member_list(self, group_id: str) -> list[dict[str, Any]]:
+    async def get_group_member_list(
+        self, group_id: str, *, no_cache: bool = False
+    ) -> list[dict[str, Any]]:
         data = await self._action(
-            "get_group_member_list", {"group_id": group_id, "no_cache": False}
+            "get_group_member_list", {"group_id": group_id, "no_cache": no_cache}
         )
         if not isinstance(data, list):
             raise OneBotError("get_group_member_list 返回格式错误")

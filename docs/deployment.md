@@ -1,7 +1,7 @@
 # Google Cloud 部署
 
 生产设计是一台 Ubuntu VM、Docker Compose，以及 NapCat、应用和可选 Caddy 三个容器。
-NapCat 与应用使用 host network，但分别只监听 `127.0.0.1:3000/6099` 和
+NapCat 与应用使用 host network，但分别只监听 `127.0.0.1:3000/3001/6099` 和
 `127.0.0.1:8000`；Caddy 是唯一公网入口。建议 2 vCPU、4 GB 内存、30 GB 磁盘和
 2 GB swap。
 
@@ -21,7 +21,7 @@ Docker/Compose，创建权限收紧的 `/var/lib/qq_mcp_server`、`cards`、`rul
 脚本生成权限为 `0600` 的 `.env` 与 `deploy.env`。`.env` 只包含 QQ 账号、持久化路径和
 OneBot token，不再包含目标群；群在服务运行后通过管理 App 白名单加入。
 
-首次启动 NapCat 后，在本机建立 SSH 转发：
+首次启动时可以先用 SSH 转发打开 NapCat：
 
 ```bash
 gcloud compute ssh qq-mcp-server --zone australia-southeast1-a \
@@ -30,6 +30,42 @@ gcloud compute ssh qq-mcp-server --zone australia-southeast1-a \
 
 打开 `http://127.0.0.1:6099/webui` 扫码。QQ 登录目录在持久卷，正常重启无需重新扫码；
 QQ 仍可能因设备授权或风控要求重新授权。不要在部署配置中保存主用 QQ 明文密码。
+
+## Tailscale 私有 NapCat 面板
+
+NapCat 仍只监听 `127.0.0.1:6099`。电脑、iOS 和 VM 加入同一个 Tailnet；不要启用
+Tailscale Funnel。Arch 使用 pacman 安装并启动：
+
+```bash
+sudo pacman -S tailscale
+sudo systemctl enable --now tailscaled
+sudo tailscale up
+```
+
+iOS 安装 Tailscale App 并登录同一账号。VM 按 Tailscale 官方 Ubuntu 软件源安装后执行：
+
+```bash
+sudo systemctl enable --now tailscaled
+sudo tailscale up
+sudo tailscale serve --bg --https=8443 http://127.0.0.1:6099
+tailscale serve status
+```
+
+在 Tailnet ACL/grants 中只允许你的身份访问该 VM 的 TCP 8443。然后在服务器 `.env` 增加：
+
+```text
+NAPCAT_WEBUI_URL=https://VM-MAGICDNS-NAME.TAILNET.ts.net:8443/webui
+NAPCAT_WEBUI_CONFIG_PATH=/data/napcat/config/webui.json
+NAPCAT_CONTROL_DIR=/data/control
+```
+
+`admin.open_napcat_webui` 只返回公网项目域名下十分钟有效的一次性入口。浏览器确认后，
+服务器读取当前 `webui.json`，再 303 跳转到带 Token 的 Tailnet URL。Token 不出现在
+MCP 返回值；最终页面也只有已登录 Tailnet 的设备能够访问。
+
+部署会安装 root 所有的 `qq-mcp-napcat-recovery.path/service`。应用没有 Docker Socket，
+只能写入固定 `restart-napcat.request`；助手校验 UID、0600 权限和十分钟冷却后，只执行
+`docker restart --time 30 qq-mcp-server-napcat`。不要把这个助手改成接受容器名或命令参数。
 
 ## 离线构建规则索引
 

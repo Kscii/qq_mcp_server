@@ -63,7 +63,7 @@ def _setup(path: Path) -> None:
 
 async def _sync_once(path: Path) -> None:
     config = load_config(path)
-    client, store, manager, _, _ = build_services(config)
+    client, store, manager, _, _, _ = build_services(config)
     try:
         targets = store.sync_targets()
         if not targets:

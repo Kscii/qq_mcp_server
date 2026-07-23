@@ -17,10 +17,23 @@ from qq_mcp_server.store import MessageStore
 
 
 class FakeOneBot:
+    async def get_login_info(self) -> dict[str, Any]:
+        return {"user_id": "1"}
+
     async def get_group_list(self) -> list[dict[str, Any]]:
         return [{"group_id": "2", "group_name": "测试群", "member_count": 4}]
 
-    async def get_group_member_list(self, group_id: str) -> list[dict[str, Any]]:
+    async def get_group_info(self, group_id: str, *, no_cache: bool = False) -> dict[str, Any]:
+        return {"group_id": group_id, "group_name": f"候选群-{group_id}"}
+
+    async def get_group_member_list(
+        self, group_id: str, *, no_cache: bool = False
+    ) -> list[dict[str, Any]]:
+        return [{"qq_user_id": "1", "display_name": "测试账号"}] if no_cache else []
+
+    async def get_group_history(
+        self, group_id: str, count: int, *, message_seq: str | None = None
+    ) -> list[dict[str, Any]]:
         return []
 
 
@@ -97,6 +110,90 @@ async def test_character_upload_preview_and_confirm(
     character = store.character(str(group["group_key"]))
     assert character is not None
     assert character["current"]["identity"]["name"] == "调查员"
+
+
+async def test_event_candidate_can_be_directly_verified_before_whitelist(
+    config: AppConfig,
+) -> None:
+    store, _, _, app = services(config)
+    store.upsert_group_candidate(
+        "3",
+        "事件发现群",
+        source="group_message_event",
+    )
+    token = store.issue_capability(
+        kind="group_whitelist", group_key=None, issued_to="local", ttl_seconds=600
+    )
+    store.set_capability_payload(
+        token,
+        kind="group_whitelist",
+        payload={"group_id": "3"},
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        preview = await client.get(f"/admin/groups/{token}")
+        confirmed = await client.post(
+            f"/admin/groups/{token}",
+            data={"action": "add", "group_id": "3"},
+        )
+
+    assert "事件发现群" in preview.text
+    assert confirmed.status_code == 200
+    assert store.get_group_by_qq("3") is not None
+
+
+async def test_napcat_launcher_hides_token_until_confirmed_redirect(
+    config: AppConfig, tmp_path: Path
+) -> None:
+    webui_config = tmp_path / "napcat" / "webui.json"
+    webui_config.parent.mkdir(parents=True)
+    webui_config.write_text('{"token":"private-webui-token"}')
+    private_config = replace(
+        config,
+        napcat_webui_url="https://qq.example-tailnet.ts.net:8443/webui",
+        napcat_webui_config_path=webui_config,
+    )
+    store, _, _, app = services(private_config)
+    token = store.issue_capability(
+        kind="napcat_webui", group_key=None, issued_to="local", ttl_seconds=600
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", follow_redirects=False
+    ) as client:
+        preview = await client.get(f"/admin/napcat/{token}")
+        redirected = await client.post(f"/admin/napcat/{token}")
+        reused = await client.post(f"/admin/napcat/{token}")
+
+    assert preview.status_code == 200
+    assert "private-webui-token" not in preview.text
+    assert redirected.status_code == 303
+    assert (
+        redirected.headers["location"]
+        == "https://qq.example-tailnet.ts.net:8443/webui?token=private-webui-token"
+    )
+    assert reused.status_code == 400
+    assert redirected.headers["cache-control"] == "no-store"
+
+
+async def test_recovery_requires_post_and_only_writes_fixed_request(
+    config: AppConfig,
+) -> None:
+    store, _, _, app = services(config)
+    token = store.issue_capability(
+        kind="napcat_recovery", group_key=None, issued_to="local", ttl_seconds=600
+    )
+    request_path = config.napcat_control_dir / "restart-napcat.request"
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        preview = await client.get(f"/admin/napcat-recovery/{token}")
+        assert not request_path.exists()
+        confirmed = await client.post(f"/admin/napcat-recovery/{token}")
+
+    assert preview.status_code == 200
+    assert confirmed.status_code == 200
+    assert request_path.is_file()
+    assert request_path.stat().st_mode & 0o777 == 0o600
 
 
 async def test_character_confirm_rejects_changed_staged_file(

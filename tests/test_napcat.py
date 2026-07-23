@@ -6,7 +6,9 @@ from pathlib import Path
 from qq_mcp_server.napcat import prepare_napcat_config
 
 
-def test_napcat_config_is_loopback_http_only_and_has_no_send_action(tmp_path: Path) -> None:
+def test_napcat_config_is_loopback_http_sse_only_and_has_no_send_action(
+    tmp_path: Path,
+) -> None:
     prepare_napcat_config(tmp_path, "secret-token", "123456789")
     onebot = json.loads((tmp_path / "onebot11.json").read_text(encoding="utf-8"))
     network = onebot["network"]
@@ -23,6 +25,20 @@ def test_napcat_config_is_loopback_http_only_and_has_no_send_action(tmp_path: Pa
             "messagePostFormat": "array",
             "token": "secret-token",
             "debug": False,
+        }
+    ]
+    assert network["httpSseServers"] == [
+        {
+            "enable": True,
+            "name": "qq_mcp_server_events",
+            "host": "127.0.0.1",
+            "port": 3001,
+            "enableCors": False,
+            "enableWebsocket": False,
+            "messagePostFormat": "array",
+            "token": "secret-token",
+            "debug": False,
+            "reportSelfMessage": False,
         }
     ]
     assert "send" not in json.dumps(onebot).lower()

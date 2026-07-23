@@ -235,6 +235,27 @@ class MessageStore:
                     last_error TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS group_candidates (
+                    group_id TEXT PRIMARY KEY,
+                    group_name TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    available INTEGER NOT NULL DEFAULT 1,
+                    verification_status TEXT NOT NULL DEFAULT 'unverified',
+                    verification_method TEXT,
+                    verified_until TEXT,
+                    last_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_group_candidates_seen
+                    ON group_candidates (available, last_seen_at DESC);
+
+                CREATE TABLE IF NOT EXISTS runtime_status (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS characters (
                     group_key TEXT PRIMARY KEY REFERENCES groups(group_key) ON DELETE CASCADE,
                     source_filename TEXT NOT NULL,
@@ -493,6 +514,117 @@ class MessageStore:
                 (group_name.strip() or group_id, _utc_now(), group_id),
             )
 
+    def upsert_group_candidate(
+        self,
+        group_id: str,
+        group_name: str,
+        *,
+        source: str,
+        available: bool = True,
+        verification_status: str | None = None,
+        verification_method: str | None = None,
+        verified_until: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if not group_id.isdigit():
+            raise ValueError("候选群号只能包含数字")
+        name = group_name.strip() or group_id
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO group_candidates (
+                       group_id, group_name, source, first_seen_at, last_seen_at, available
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (group_id, name, source, now, now, int(available)),
+            )
+            connection.execute(
+                """UPDATE group_candidates SET group_name = ?, source = ?,
+                          last_seen_at = ?, available = ?, last_error = ?
+                   WHERE group_id = ?""",
+                (name, source, now, int(available), error[:500] if error else None, group_id),
+            )
+            if verification_status is not None:
+                connection.execute(
+                    """UPDATE group_candidates SET verification_status = ?,
+                              verification_method = ?, verified_until = ?
+                       WHERE group_id = ?""",
+                    (
+                        verification_status,
+                        verification_method,
+                        verified_until,
+                        group_id,
+                    ),
+                )
+        result = self.group_candidate(group_id)
+        assert result is not None
+        return result
+
+    def mark_group_candidate_unavailable(self, group_id: str, *, source: str) -> None:
+        existing = self.group_candidate(group_id)
+        self.upsert_group_candidate(
+            group_id,
+            str(existing["group_name"]) if existing else group_id,
+            source=source,
+            available=False,
+            verification_status="unverified",
+            verification_method=None,
+            verified_until=None,
+        )
+
+    @staticmethod
+    def _candidate_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["available"] = bool(result["available"])
+        verified_until = result.get("verified_until")
+        result["verification_valid"] = bool(
+            verified_until
+            and datetime.fromisoformat(str(verified_until)) > datetime.now(UTC)
+            and result["verification_status"] == "verified"
+        )
+        return result
+
+    def group_candidate(self, group_id: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM group_candidates WHERE group_id = ?", (group_id,)
+            ).fetchone()
+        return self._candidate_from_row(row) if row else None
+
+    def list_group_candidates(self, *, available_only: bool = True) -> list[dict[str, Any]]:
+        where = "WHERE available = 1" if available_only else ""
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM group_candidates {where}
+                    ORDER BY last_seen_at DESC, group_id"""
+            ).fetchall()
+        return [self._candidate_from_row(row) for row in rows]
+
+    def set_runtime_status(self, key: str, value: dict[str, Any]) -> None:
+        if not key or len(key) > 80:
+            raise ValueError("运行状态键格式错误")
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO runtime_status (key, value_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT (key) DO UPDATE SET
+                       value_json = excluded.value_json,
+                       updated_at = excluded.updated_at""",
+                (key, _json(value), now),
+            )
+
+    def runtime_status(self, key: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT value_json, updated_at FROM runtime_status WHERE key = ?", (key,)
+            ).fetchone()
+        if row is None:
+            return {"updated_at": None}
+        value = _unjson(row["value_json"], {})
+        if not isinstance(value, dict):
+            value = {}
+        return {**value, "updated_at": str(row["updated_at"])}
+
     def upsert(self, messages: Iterable[ChatMessage]) -> tuple[int, int]:
         batch = list(messages)
         if not batch:
@@ -621,7 +753,18 @@ class MessageStore:
             )
 
     def record_error(self, *, account_id: str, group_id: str, error: str) -> None:
-        self.update_state(account_id=account_id, group_id=group_id, error=error[:500])
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO sync_state (
+                    group_id, account_id, recent_ready, initial_import_complete, last_error
+                ) VALUES (?, ?, 0, 0, ?)
+                ON CONFLICT (group_id) DO UPDATE SET
+                    account_id = excluded.account_id,
+                    last_error = excluded.last_error
+                """,
+                (group_id, account_id, error[:500]),
+            )
 
     def message_exists(self, group_id: str, message_id: str) -> bool:
         with closing(self._connect()) as connection:

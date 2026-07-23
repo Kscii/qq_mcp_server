@@ -16,7 +16,7 @@ def _atomic_json(path: Path, value: object) -> None:
 
 
 def prepare_napcat_config(directory: Path, onebot_token: str, account_id: str) -> None:
-    """生成仅监听回环地址、仅启用 HTTP 的 NapCat 配置。"""
+    """生成仅监听回环地址的只读 HTTP 与 HTTP-SSE NapCat 配置。"""
     if not onebot_token:
         raise ValueError("ONEBOT_ACCESS_TOKEN 不能为空")
     if not account_id.isdigit():
@@ -76,7 +76,20 @@ def _onebot_config(token: str) -> dict[str, Any]:
                     "debug": False,
                 }
             ],
-            "httpSseServers": [],
+            "httpSseServers": [
+                {
+                    "enable": True,
+                    "name": "qq_mcp_server_events",
+                    "host": "127.0.0.1",
+                    "port": 3001,
+                    "enableCors": False,
+                    "enableWebsocket": False,
+                    "messagePostFormat": "array",
+                    "token": token,
+                    "debug": False,
+                    "reportSelfMessage": False,
+                }
+            ],
             "httpClients": [],
             "websocketServers": [],
             "websocketClients": [],

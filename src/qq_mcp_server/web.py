@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import html
+import json
 import secrets
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastmcp import FastMCP
 from starlette.datastructures import UploadFile
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, Response
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from qq_mcp_server.cards import CharacterCardService, ParsedCard
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.onebot import OneBotClient
+from qq_mcp_server.runtime import NapCatRuntime
 from qq_mcp_server.store import MessageStore
 
 
@@ -57,25 +60,43 @@ def register_web_routes(
     store: MessageStore,
     client: OneBotClient,
     cards: CharacterCardService,
+    runtime: NapCatRuntime,
 ) -> None:
     @mcp.custom_route("/admin/groups/{token}", methods=["GET", "POST"], include_in_schema=False)
     async def group_whitelist(request: Request) -> Response:
         token = str(request.path_params["token"])
         try:
-            store.capability(token, kind="group_whitelist")
-            joined = await client.get_group_list()
+            capability = store.capability(token, kind="group_whitelist")
+            registry_warning = ""
+            try:
+                joined = await runtime.refresh_registry()
+            except Exception as error:
+                joined = []
+                registry_warning = (
+                    '<div class="card"><p><strong>当前无法刷新 QQ 群列表。</strong></p>'
+                    f"<p>{html.escape(str(error))}</p>"
+                    "<p>仍会显示由消息事件或直接验证发现的候选群。</p></div>"
+                )
             joined_by_id = {str(item["group_id"]): item for item in joined}
             if request.method == "POST":
                 form = await request.form()
                 action = str(form.get("action") or "")
                 if action == "add":
                     group_id = str(form.get("group_id") or "")
-                    if group_id not in joined_by_id:
-                        raise ValueError("该群不在当前 QQ 已加入群列表中")
-                    item = joined_by_id[group_id]
-                    group = store.whitelist_group(group_id, str(item["group_name"]))
+                    item = joined_by_id.get(group_id)
+                    if item is None:
+                        proof = await runtime.probe_group(group_id)
+                        if proof["status"] not in {"verified", "group_registry_stale"}:
+                            raise ValueError(
+                                "无法确认当前 QQ 仍在该群中："
+                                + str(proof.get("error") or proof["status"])
+                            )
+                        group_name = str(proof.get("group_name") or group_id)
+                    else:
+                        group_name = str(item["group_name"])
+                    group = store.whitelist_group(group_id, group_name)
                     message = (
-                        f"已将 {html.escape(str(item['group_name']))} 加入白名单。"
+                        f"已将 {html.escape(group_name)} 加入白名单。"
                         f"群 App 地址：<code>{html.escape(_group_mcp_url(config, str(group['group_key'])))}</code>"
                     )
                 elif action == "remove":
@@ -94,10 +115,39 @@ def register_web_routes(
                 )
 
             whitelisted = {str(item["qq_group_id"]): item for item in store.list_groups()}
+            candidates = {str(item["group_id"]): item for item in store.list_group_candidates()}
+            requested_group_id = str(capability["payload"].get("group_id") or "")
+            visible = dict(joined_by_id)
+            for group_id, candidate in candidates.items():
+                visible.setdefault(
+                    group_id,
+                    {
+                        "group_id": group_id,
+                        "group_name": candidate["group_name"],
+                        "member_count": 0,
+                        "candidate": candidate,
+                    },
+                )
             rows: list[str] = []
-            for item in joined:
+            for item in sorted(
+                visible.values(),
+                key=lambda value: (
+                    str(value["group_id"]) != requested_group_id,
+                    str(value["group_name"]),
+                    str(value["group_id"]),
+                ),
+            ):
                 group_id = str(item["group_id"])
                 name = html.escape(str(item["group_name"]))
+                candidate_details = candidates.get(group_id)
+                if group_id in joined_by_id:
+                    discovery = "强制群列表"
+                elif candidate_details and candidate_details["verification_valid"]:
+                    discovery = "已直接验证（群列表缺失）"
+                elif candidate_details:
+                    discovery = "事件候选，添加时重新验证"
+                else:
+                    discovery = "未知"
                 if group_id in whitelisted:
                     group = whitelisted[group_id]
                     action = (
@@ -113,14 +163,80 @@ def register_web_routes(
                     )
                 rows.append(
                     f"<tr><td>{name}</td><td>{html.escape(group_id)}</td>"
-                    f"<td>{int(item['member_count'])}</td><td>{action}</td></tr>"
+                    f"<td>{html.escape(discovery)}</td><td>{action}</td></tr>"
                 )
             body = (
                 '<p class="muted">这里只维护数据采集白名单。模组、成员角色和启停继续在管理 App 中完成。</p>'
-                "<table><thead><tr><th>群</th><th>群号</th><th>人数</th><th>操作</th></tr></thead>"
+                f"{registry_warning}"
+                "<table><thead><tr><th>群</th><th>群号</th><th>来源</th><th>操作</th></tr></thead>"
                 f"<tbody>{''.join(rows)}</tbody></table>"
             )
             return _page("QQ群白名单", body)
+        except Exception as error:
+            return _error(error)
+
+    @mcp.custom_route("/admin/napcat/{token}", methods=["GET", "POST"], include_in_schema=False)
+    async def napcat_webui(request: Request) -> Response:
+        token = str(request.path_params["token"])
+        try:
+            store.capability(token, kind="napcat_webui")
+            if not config.napcat_webui_url:
+                raise ValueError("服务器尚未配置 Tailscale NapCat WebUI 地址")
+            if request.method == "GET":
+                status = await runtime.get_status()
+                return _page(
+                    "打开 NapCat 私有面板",
+                    '<div class="card">'
+                    f"<p>目标 QQ：<strong>{html.escape(config.account_id)}</strong></p>"
+                    f"<p>当前状态：<strong>{html.escape(str(status['status']))}</strong></p>"
+                    "<p>继续后将跳转到仅你的 Tailscale 设备可访问的完整 NapCat 面板。"
+                    "长期 WebUI Token 不会返回给 AI。</p>"
+                    '<form method="post"><button type="submit">打开 NapCat 面板</button></form>'
+                    "</div>",
+                )
+            store.capability(token, kind="napcat_webui", consume=True)
+            target = _napcat_webui_target(config)
+            response = RedirectResponse(target, status_code=303)
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            return response
+        except Exception as error:
+            return _error(error)
+
+    @mcp.custom_route(
+        "/admin/napcat-recovery/{token}",
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
+    async def napcat_recovery(request: Request) -> Response:
+        token = str(request.path_params["token"])
+        try:
+            capability = store.capability(token, kind="napcat_recovery")
+            if request.method == "GET":
+                return _page(
+                    "确认恢复 NapCat",
+                    '<div class="card"><p><strong>此操作会重启 NapCat。</strong></p>'
+                    "<p>消息同步会短暂中断；QQ 可能要求重新扫码登录。"
+                    "每 10 分钟最多执行一次。</p>"
+                    '<form method="post"><button class="danger" type="submit">'
+                    "确认重启 NapCat</button></form></div>",
+                )
+            runtime.request_restart()
+            store.capability(token, kind="napcat_recovery", consume=True)
+            webui_token = store.issue_capability(
+                kind="napcat_webui",
+                group_key=None,
+                issued_to=str(capability["issued_to"]),
+                ttl_seconds=config.upload_token_ttl_seconds,
+            )
+            return _page(
+                "NapCat 恢复已提交",
+                '<div class="card"><p>主机恢复助手已收到固定重启请求。</p>'
+                "<p>请等待约 20 秒，再打开私有面板检查登录状态。</p>"
+                f'<p><a href="{html.escape(napcat_webui_url(config, webui_token))}">'
+                "打开 NapCat 面板</a></p></div>",
+            )
         except Exception as error:
             return _error(error)
 
@@ -251,3 +367,26 @@ def admin_page_url(config: AppConfig, token: str) -> str:
 
 def card_upload_url(config: AppConfig, token: str) -> str:
     return f"{_base_url(config)}/uploads/character-card/{token}"
+
+
+def napcat_webui_url(config: AppConfig, token: str) -> str:
+    return f"{_base_url(config)}/admin/napcat/{token}"
+
+
+def napcat_recovery_url(config: AppConfig, token: str) -> str:
+    return f"{_base_url(config)}/admin/napcat-recovery/{token}"
+
+
+def _napcat_webui_target(config: AppConfig) -> str:
+    if not config.napcat_webui_url:
+        raise ValueError("服务器尚未配置 Tailscale NapCat WebUI 地址")
+    try:
+        payload = json.loads(config.napcat_webui_config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError("NapCat WebUI 配置文件不存在") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("NapCat WebUI 配置文件无法读取") from error
+    token = str(payload.get("token") or "") if isinstance(payload, dict) else ""
+    if not token or len(token) > 512:
+        raise ValueError("NapCat WebUI Token 不可用")
+    return f"{config.napcat_webui_url}?{urlencode({'token': token})}"

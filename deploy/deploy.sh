@@ -16,6 +16,13 @@ compose() {
     docker compose --env-file .env --env-file deploy.env "$@"
 }
 
+if [ "$(id -u)" -eq 0 ]; then
+    ./install-recovery-helper.sh
+elif ! systemctl is-enabled --quiet qq-mcp-napcat-recovery.path; then
+    echo "缺少 NapCat 恢复助手；请先以 root 运行 install-recovery-helper.sh" >&2
+    exit 2
+fi
+
 registry="australia-southeast1-docker.pkg.dev"
 access_token="$(
     curl -fsS -H 'Metadata-Flavor: Google' \

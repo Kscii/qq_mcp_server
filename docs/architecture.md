@@ -3,8 +3,9 @@
 ```text
 单个 NapCat / QQ 账号（QQ 侧永久只读）
             │
+            ├── HTTP-SSE 群事件（实时）
             ├── get_group_list / get_group_member_list
-            └── get_group_info / get_group_msg_history
+            └── get_group_info / get_group_msg_history（轮询补漏）
                             │
                             ▼
                     qq_mcp_server
@@ -21,7 +22,7 @@
        跨群管理 App                 永久绑定一个白名单群
               │
        一次性最小 Web 页面
-       白名单 / XLSX 上传确认
+       白名单 / XLSX / NapCat 登录与恢复确认
 ```
 
 ## 隔离模型
@@ -44,10 +45,17 @@ ChatGPT 对话只连接该群的 MCP 地址。这比每次工具调用传群名�
 
 ## 同步与消息边界
 
+`NapCatRuntime` 持续消费仅监听回环的 HTTP-SSE。白名单群消息立即标准化入库；非白名单
+群只记录群号、群名、发现来源和时间，不保存正文。加群事件和实际群消息可以发现候选群，
+但永远不会自动加入白名单。强制群列表缺失时，管理 MCP 可用群详情、当前账号成员身份或
+可读历史直接验证，最终仍由一次性网页人工确认。
+
 `MultiGroupSyncManager` 周期性读取白名单并动态增删每群任务，共用并发上限。新群先抓
 最近一页，使 App 尽快可用；随后向更早历史分页回填。分页游标、最近就绪和完整回填状态
 逐群保存，重启后续传。消息唯一键是 `(group_id, message_id)`，重叠分页依赖 SQLite
-幂等去重。
+幂等去重。SSE 提供低延迟，默认 15 秒轮询是权威补漏通道；最近成功轮询超过 60 秒或
+最近一次轮询失败时，跑团上下文拒绝返回旧数据。群列表本身陈旧但目标群同步新鲜时不会
+阻断跑团。
 
 只接受文字、`@` 和 reply ID。混合媒体消息保留可读文字，纯媒体消息写成
 `[未读取的媒体消息]` 并标记 `contains_unsupported_media`，不请求媒体 URL。撤回事件不
@@ -81,10 +89,11 @@ PDF 上传或服务器端 LLM。
 - `normalization.py`：文本、`@`、引用和未读媒体标记标准化。
 - `store.py`：群注册表、消息、角色、人物卡、笔记、变更和能力链接事务。
 - `sync.py`：最近优先、多群并发、断点历史回填。
+- `runtime.py`：SSE、群发现、直接验证、诊断状态和受限恢复请求。
 - `cards.py`：固定 Excel 模板解析、预览、换卡策略和存储。
 - `rules.py`：三本 PDF 的离线构建与运行期只读检索。
 - `mcp_server.py`：管理/群 MCP 工具、OAuth 和群路径隔离。
-- `web.py`：只有白名单与人物卡上传确认的能力链接页面。
+- `web.py`：白名单、人物卡、NapCat 私有跳转和恢复确认的能力链接页面。
 - `ai_instructions.py`：内置工具选择、安全、符号和三候选跑团规则。
 - `cli.py`：配置、同步、运行、状态、规则构建和 NapCat 安全配置。
 

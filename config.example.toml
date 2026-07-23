@@ -2,8 +2,11 @@
 [qq]
 account_id = "123456789"
 onebot_url = "http://127.0.0.1:3000"
+onebot_sse_url = "http://127.0.0.1:3001/_events"
 poll_interval_seconds = 15
 registry_refresh_seconds = 5
+group_discovery_interval_seconds = 60
+context_freshness_seconds = 60
 sync_concurrency = 3
 page_size = 100
 request_timeout_seconds = 20
@@ -22,6 +25,9 @@ host = "127.0.0.1"
 port = 8000
 upload_token_ttl_seconds = 600
 # public_url = "https://qq-mcp.example.com"
+# napcat_webui_url = "https://qq-mcp-server.example-tailnet.ts.net:8443/webui"
+# napcat_webui_config = "data/napcat/config/webui.json"
+# napcat_control_dir = "data/control"
 
 [access]
 # allowed_google_emails = ["you@gmail.com"]

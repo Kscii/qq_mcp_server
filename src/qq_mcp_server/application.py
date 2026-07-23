@@ -11,6 +11,7 @@ from qq_mcp_server.config import AppConfig, ConfigError
 from qq_mcp_server.mcp_server import create_http_app, create_mcp_servers
 from qq_mcp_server.onebot import OneBotClient
 from qq_mcp_server.rules import RuleIndex
+from qq_mcp_server.runtime import NapCatRuntime
 from qq_mcp_server.store import MessageStore
 from qq_mcp_server.sync import MultiGroupSyncManager
 
@@ -23,6 +24,7 @@ def build_services(
     MultiGroupSyncManager,
     RuleIndex,
     CharacterCardService,
+    NapCatRuntime,
 ]:
     token = os.environ.get("ONEBOT_ACCESS_TOKEN", "").strip()
     if not token:
@@ -35,9 +37,10 @@ def build_services(
         history_timeout=config.history_timeout_seconds,
     )
     manager = MultiGroupSyncManager(config, client, store)
+    runtime = NapCatRuntime(config, client, store, token)
     rules = RuleIndex(config.rules_database_path)
     cards = CharacterCardService(store, config.card_storage_dir)
-    return client, store, manager, rules, cards
+    return client, store, manager, rules, cards, runtime
 
 
 async def run_server(config: AppConfig) -> None:
@@ -45,8 +48,8 @@ async def run_server(config: AppConfig) -> None:
     # parameter. httpx's INFO request log includes the full URL, so keep it out
     # of production logs while retaining warnings and errors.
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    client, store, manager, rules, cards = build_services(config)
-    admin, group = create_mcp_servers(config, store, client, rules, cards)
+    client, store, manager, rules, cards, runtime = build_services(config)
+    admin, group = create_mcp_servers(config, store, client, rules, cards, runtime=runtime)
     app = create_http_app(admin, group, store)
     logging.getLogger(__name__).info(
         "Admin MCP: %s:%d/mcp/admin；每群 MCP: /mcp/groups/{group_key}",
@@ -65,6 +68,8 @@ async def run_server(config: AppConfig) -> None:
     try:
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(manager.run_forever())
+            tasks.create_task(runtime.run_sse_forever())
+            tasks.create_task(runtime.run_discovery_forever())
             tasks.create_task(server.serve())
     finally:
         await client.close()
