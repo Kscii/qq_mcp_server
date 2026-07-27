@@ -1486,9 +1486,11 @@ def create_mcp_servers(
             group_id,
             timestamp=context_start,
         )
-        accepted_gaps = [
-            gap for gap in store.list_message_gaps(group_id=group_id) if gap["status"] == "accepted"
-        ]
+        accepted_gap_summary = store.accepted_message_gaps_overlapping(
+            group_id,
+            start_at=context_start,
+            end_at=context_end,
+        )
         character = store.character(group_key)
         return {
             "notice": _UNTRUSTED_NOTICE,
@@ -1524,7 +1526,9 @@ def create_mcp_servers(
                     "end_at": context_end,
                 },
                 "older_unresolved_gaps": older_gaps,
-                "accepted_unverified_gaps": accepted_gaps,
+                "accepted_unverified_gap_count": accepted_gap_summary["count"],
+                "accepted_unverified_gaps": accepted_gap_summary["gaps"],
+                "accepted_unverified_gaps_truncated": accepted_gap_summary["truncated"],
                 "complete_for_returned_range": True,
             },
             "rules": rules.health(),

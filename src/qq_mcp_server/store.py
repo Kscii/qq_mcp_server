@@ -1139,6 +1139,38 @@ class MessageStore:
             ).fetchall()
         return [self._gap_from_row(row) for row in rows]
 
+    def accepted_message_gaps_overlapping(
+        self, group_id: str, *, start_at: int, end_at: int, limit: int = 5
+    ) -> dict[str, Any]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit 必须在 1 到 100 之间")
+        parameters = (group_id, end_at, start_at)
+        with closing(self._connect()) as connection:
+            count = connection.execute(
+                """SELECT COUNT(*) FROM message_gaps
+                   WHERE group_id = ?
+                     AND status = 'accepted'
+                     AND start_at <= ?
+                     AND COALESCE(end_at, 9223372036854775807) >= ?""",
+                parameters,
+            ).fetchone()[0]
+            rows = connection.execute(
+                """SELECT * FROM message_gaps
+                   WHERE group_id = ?
+                     AND status = 'accepted'
+                     AND start_at <= ?
+                     AND COALESCE(end_at, 9223372036854775807) >= ?
+                   ORDER BY start_at DESC, created_at DESC
+                   LIMIT ?""",
+                (*parameters, limit),
+            ).fetchall()
+        gaps = [self._gap_from_row(row) for row in rows]
+        return {
+            "count": int(count),
+            "gaps": gaps,
+            "truncated": int(count) > len(gaps),
+        }
+
     def unresolved_message_gaps_before(
         self, group_id: str, *, timestamp: int
     ) -> list[dict[str, Any]]:

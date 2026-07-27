@@ -347,3 +347,47 @@ async def test_group_context_refuses_range_overlapping_unresolved_gap(
         result = await client.call_tool("trpg.get_roleplay_context", {})
 
     assert result.data["error"]["code"] == "MESSAGE_GAP_OVERLAPS_CONTEXT"
+
+
+async def test_group_context_only_returns_accepted_gaps_overlapping_returned_range(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.upsert([message("100", "较早消息"), message("200", "最新消息")])
+    older = store.create_message_gap(
+        "2",
+        start_at=1,
+        end_at=2,
+        confidence="suspected",
+        source="manual",
+    )
+    overlapping = store.create_message_gap(
+        "2",
+        start_at=250,
+        end_at=300,
+        confidence="suspected",
+        source="manual",
+    )
+    store.accept_message_gap(str(older["gap_id"]), reason="已知旧缺口")
+    store.accept_message_gap(str(overlapping["gap_id"]), reason="已知范围内缺口")
+    store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
+    store.set_runtime_status("sse", {"connected": True, "online": True, "good": True})
+    _, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    async with Client(group_mcp) as client:
+        result = await client.call_tool("trpg.get_roleplay_context", {"limit": 1})
+
+    collection = result.data["collection"]
+    assert collection["accepted_unverified_gap_count"] == 1
+    assert collection["accepted_unverified_gaps_truncated"] is False
+    assert [gap["gap_id"] for gap in collection["accepted_unverified_gaps"]] == [
+        overlapping["gap_id"]
+    ]
