@@ -264,18 +264,20 @@
             <p class="muted">群版本 {{ group.version }}</p>
           </section>
           <section class="card">
-            <h2>消息同步</h2>
-            <p class="metric {{ 'good' if freshness.fresh else 'bad' }}">
-              {{ "新鲜" if freshness.fresh else "需要检查" }}
+            <h2>SSE 实时采集</h2>
+            <p class="metric {{ 'good' if sse.healthy else 'bad' }}">
+              {{ "连接健康" if sse.healthy else "需要检查" }}
             </p>
             <p class="muted">
-              {% if freshness.age_seconds is not none %}{{ freshness.age_seconds }} 秒前{% else %}尚无同步时间{% endif %}
+              {{ sse.updated_at_display or "尚无采集状态" }}
             </p>
           </section>
           <section class="card">
             <h2>已保存消息</h2>
-            <p class="metric">{{ sync.message_count }}</p>
-            <p class="muted">{{ "历史回填完成" if sync.initial_import_complete else "历史仍在回填" }}</p>
+            <p class="metric">{{ message_state.message_count }}</p>
+            <p class="muted">
+              {% if unresolved_gaps %}存在 {{ unresolved_gaps|length }} 个未解决缺口{% else %}没有已知缺口{% endif %}
+            </p>
           </section>
         </div>
         <div class="grid">
@@ -285,10 +287,11 @@
               <dt>模组标题</dt><dd>{{ group.module_title or "未设置" }}</dd>
               <dt>显示标签</dt><dd>{{ group.display_label or "未设置" }}</dd>
               <dt>当前人物</dt><dd>{{ character_name or "尚未上传人物卡" }}</dd>
-              <dt>最近同步</dt><dd>{{ sync.last_sync_at_display or "尚无" }}</dd>
+              <dt>SSE 状态</dt><dd>{{ "已连接" if sse.connected else "未连接" }}</dd>
               <dt>消息时间范围</dt>
-              <dd>{{ sync.oldest_time_display or "尚无" }} — {{ sync.newest_time_display or "尚无" }}</dd>
-              <dt>同步错误</dt><dd class="{{ 'bad' if sync.last_error else '' }}">{{ sync.last_error or "无" }}</dd>
+              <dd>{{ message_state.oldest_time_display or "尚无" }} — {{ message_state.newest_time_display or "尚无" }}</dd>
+              <dt>采集错误</dt><dd class="{{ 'bad' if sse.last_error else '' }}">{{ sse.last_error or "无" }}</dd>
+              <dt>未解决缺口</dt><dd class="{{ 'warn' if unresolved_gaps else '' }}">{{ unresolved_gaps|length }}</dd>
             </dl>
           </section>
           <section class="card">

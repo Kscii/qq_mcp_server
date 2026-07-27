@@ -40,7 +40,7 @@ def test_napcat_config_is_loopback_http_sse_only_and_has_no_send_action(
             "messagePostFormat": "array",
             "token": "secret-token",
             "debug": False,
-            "reportSelfMessage": False,
+            "reportSelfMessage": True,
         }
     ]
     assert "send" not in json.dumps(onebot).lower()

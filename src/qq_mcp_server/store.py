@@ -45,7 +45,7 @@ def backup_database(path: Path, directory: Path) -> Path:
     target_directory = directory.expanduser().resolve()
     target_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    target = target_directory / f"{source_path.stem}.pre-v3.{timestamp}.sqlite3"
+    target = target_directory / f"{source_path.stem}.pre-v4.{timestamp}.sqlite3"
     with (
         closing(sqlite3.connect(source_path)) as source,
         closing(sqlite3.connect(target)) as destination,
@@ -195,7 +195,7 @@ class MessageStore:
                     "SELECT value FROM app_metadata WHERE key = 'schema_version'"
                 ).fetchone()
                 schema_version = str(schema[0]) if schema else None
-                if schema_version not in {"2", "3"}:
+                if schema_version not in {"2", "3", "4"}:
                     raise ValueError("数据库 schema_version 不受支持；请使用新的 database 路径")
             connection.executescript(
                 """
@@ -205,7 +205,7 @@ class MessageStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-                INSERT OR IGNORE INTO app_metadata(key, value) VALUES ('schema_version', '3');
+                INSERT OR IGNORE INTO app_metadata(key, value) VALUES ('schema_version', '4');
 
                 CREATE TABLE IF NOT EXISTS groups (
                     group_key TEXT PRIMARY KEY,
@@ -231,8 +231,8 @@ class MessageStore:
                     display_name TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (group_key, qq_user_id, role)
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_player_per_group
-                    ON group_member_roles (group_key) WHERE role = 'player';
+                CREATE INDEX IF NOT EXISTS idx_group_member_roles_role
+                    ON group_member_roles (group_key, role, qq_user_id);
 
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -299,6 +299,88 @@ class MessageStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_runtime_events_time
                     ON runtime_events (created_at DESC, id DESC);
+
+                CREATE TABLE IF NOT EXISTS collector_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    connected_at TEXT NOT NULL,
+                    last_heartbeat_at TEXT,
+                    heartbeat_interval_ms INTEGER,
+                    online INTEGER,
+                    good INTEGER,
+                    ended_at TEXT,
+                    end_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_collector_sessions_time
+                    ON collector_sessions (connected_at DESC);
+
+                CREATE TABLE IF NOT EXISTS message_gaps (
+                    gap_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    start_at INTEGER NOT NULL,
+                    end_at INTEGER,
+                    confidence TEXT NOT NULL
+                        CHECK (confidence IN ('confirmed', 'suspected')),
+                    source TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN (
+                            'open', 'paused', 'repairing', 'repaired',
+                            'unverified', 'accepted'
+                        )),
+                    before_message_id TEXT,
+                    after_message_id TEXT,
+                    repair_cursor TEXT,
+                    pages_attempted INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    accepted_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_gaps_group_time
+                    ON message_gaps (group_id, start_at, status);
+
+                CREATE TABLE IF NOT EXISTS onebot_action_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'error')),
+                    latency_ms REAL NOT NULL,
+                    error_type TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_onebot_action_audit_time
+                    ON onebot_action_audit (created_at DESC, action);
+
+                CREATE TABLE IF NOT EXISTS qq_accounts (
+                    account_id TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('registered', 'pending', 'active', 'disabled')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_activated_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_qq_account
+                    ON qq_accounts (status) WHERE status = 'active';
+
+                CREATE TABLE IF NOT EXISTS qq_account_switches (
+                    switch_id TEXT PRIMARY KEY,
+                    from_account_id TEXT,
+                    target_account_id TEXT NOT NULL
+                        REFERENCES qq_accounts(account_id),
+                    status TEXT NOT NULL
+                        CHECK (status IN (
+                            'requested', 'host_pending', 'awaiting_login',
+                            'completed', 'failed', 'cancelled'
+                        )),
+                    requested_by TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    confirmed_at TEXT,
+                    completed_at TEXT,
+                    error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_qq_account_switches_time
+                    ON qq_account_switches (requested_at DESC);
 
                 CREATE TABLE IF NOT EXISTS characters (
                     group_key TEXT PRIMARY KEY REFERENCES groups(group_key) ON DELETE CASCADE,
@@ -372,6 +454,12 @@ class MessageStore:
                 connection.execute(
                     "UPDATE app_metadata SET value = '3' WHERE key = 'schema_version'"
                 )
+                schema_version = "3"
+            if schema_version in {"2", "3"}:
+                connection.execute("DROP INDEX IF EXISTS idx_one_player_per_group")
+                connection.execute(
+                    "UPDATE app_metadata SET value = '4' WHERE key = 'schema_version'"
+                )
             connection.commit()
         self.path.chmod(0o600)
 
@@ -415,7 +503,7 @@ class MessageStore:
                 "SELECT * FROM groups WHERE group_key = ?", (group_key,)
             ).fetchone()
         if row is None or (require_whitelisted and not row["whitelisted"]):
-            raise KeyError("群不在白名单中")
+            raise KeyError("群尚未授权 AI 访问")
         return self._group_from_row(row)
 
     def get_group_by_qq(self, group_id: str) -> dict[str, Any] | None:
@@ -469,7 +557,7 @@ class MessageStore:
             "SELECT version FROM groups WHERE group_key = ? AND whitelisted = 1", (group_key,)
         ).fetchone()
         if row is None:
-            raise KeyError("群不在白名单中")
+            raise KeyError("群尚未授权 AI 访问")
         current = int(row[0])
         if current != expected:
             raise VersionConflictError(current)
@@ -541,9 +629,10 @@ class MessageStore:
                    WHERE group_key = ? ORDER BY role, qq_user_id""",
                 (group_key,),
             ).fetchall()
-        player = next((str(row["qq_user_id"]) for row in rows if row["role"] == "player"), None)
+        players = [str(row["qq_user_id"]) for row in rows if row["role"] == "player"]
         return {
-            "player_qq_user_id": player,
+            "player_qq_user_id": players[0] if players else None,
+            "player_qq_user_ids": players,
             "kp_qq_user_ids": [str(row["qq_user_id"]) for row in rows if row["role"] == "kp"],
             "dice_bot_qq_user_ids": [
                 str(row["qq_user_id"]) for row in rows if row["role"] == "dice_bot"
@@ -557,18 +646,27 @@ class MessageStore:
         *,
         expected_version: int,
         player_qq_user_id: str,
+        player_qq_user_ids: list[str] | None = None,
         kp_qq_user_ids: list[str],
         dice_bot_qq_user_ids: list[str],
         display_names: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        ids = [player_qq_user_id, *kp_qq_user_ids, *dice_bot_qq_user_ids]
+        players = list(
+            dict.fromkeys(
+                [
+                    player_qq_user_id,
+                    *(player_qq_user_ids or []),
+                ]
+            )
+        )
+        ids = [*players, *kp_qq_user_ids, *dice_bot_qq_user_ids]
         if any(not item.isdigit() for item in ids):
             raise ValueError("成员 QQ 号只能包含数字")
         if len(ids) != len(set(ids)):
             raise ValueError("同一个 QQ 成员不能同时承担多个特殊身份")
         names = display_names or {}
         rows = [
-            (group_key, player_qq_user_id, "player", names.get(player_qq_user_id, "")),
+            *[(group_key, item, "player", names.get(item, "")) for item in players],
             *[(group_key, item, "kp", names.get(item, "")) for item in kp_qq_user_ids],
             *[(group_key, item, "dice_bot", names.get(item, "")) for item in dice_bot_qq_user_ids],
         ]
@@ -747,6 +845,623 @@ class MessageStore:
             }
             for row in rows
         ]
+
+    def start_collector_session(self, account_id: str) -> dict[str, Any]:
+        if not account_id.isdigit():
+            raise ValueError("采集账号必须是 QQ 号")
+        session_id = f"ses_{secrets.token_urlsafe(12)}"
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO collector_sessions (
+                       session_id, account_id, connected_at
+                   ) VALUES (?, ?, ?)""",
+                (session_id, account_id, now),
+            )
+        return self.collector_session(session_id)
+
+    def collector_session(self, session_id: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM collector_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError("采集会话不存在")
+        result = dict(row)
+        result["online"] = None if result["online"] is None else bool(result["online"])
+        result["good"] = None if result["good"] is None else bool(result["good"])
+        return result
+
+    def active_collector_session(self) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT * FROM collector_sessions WHERE ended_at IS NULL
+                   ORDER BY connected_at DESC LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        return self.collector_session(str(row["session_id"]))
+
+    def update_collector_heartbeat(
+        self,
+        session_id: str,
+        *,
+        interval_ms: int | None,
+        online: bool | None,
+        good: bool | None,
+    ) -> dict[str, Any]:
+        if interval_ms is not None and not 1000 <= interval_ms <= 3_600_000:
+            interval_ms = None
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE collector_sessions
+                   SET last_heartbeat_at = ?, heartbeat_interval_ms = ?,
+                       online = ?, good = ?
+                   WHERE session_id = ? AND ended_at IS NULL""",
+                (
+                    _utc_now(),
+                    interval_ms,
+                    None if online is None else int(online),
+                    None if good is None else int(good),
+                    session_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise KeyError("当前采集会话不存在或已经结束")
+        return self.collector_session(session_id)
+
+    def end_collector_session(self, session_id: str, *, reason: str) -> dict[str, Any]:
+        text = reason.strip()[:500] or "unknown"
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """UPDATE collector_sessions SET ended_at = COALESCE(ended_at, ?),
+                          end_reason = COALESCE(end_reason, ?)
+                   WHERE session_id = ?""",
+                (_utc_now(), text, session_id),
+            )
+        return self.collector_session(session_id)
+
+    def close_abandoned_collector_session(self) -> dict[str, Any] | None:
+        active = self.active_collector_session()
+        if active is None:
+            return None
+        self.end_collector_session(str(active["session_id"]), reason="unclean_restart")
+        return active
+
+    def collected_group_ids(self) -> list[str]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT group_id FROM group_candidates
+                   UNION
+                   SELECT group_id FROM messages
+                   ORDER BY group_id"""
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    @staticmethod
+    def _gap_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["pages_attempted"] = int(result["pages_attempted"])
+        return result
+
+    @staticmethod
+    def _message_boundary(
+        connection: sqlite3.Connection,
+        group_id: str,
+        timestamp: int,
+        *,
+        before: bool,
+    ) -> str | None:
+        operator = "<=" if before else ">="
+        order = "DESC" if before else "ASC"
+        row = connection.execute(
+            f"""SELECT message_id FROM messages
+                WHERE group_id = ? AND sent_at {operator} ?
+                ORDER BY sent_at {order}, id {order} LIMIT 1""",
+            (group_id, timestamp),
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def create_message_gap(
+        self,
+        group_id: str,
+        *,
+        start_at: int,
+        end_at: int | None,
+        confidence: str,
+        source: str,
+    ) -> dict[str, Any]:
+        if not group_id.isdigit():
+            raise ValueError("缺口群号只能包含数字")
+        if confidence not in {"confirmed", "suspected"}:
+            raise ValueError("confidence 必须是 confirmed 或 suspected")
+        if start_at <= 0 or (end_at is not None and end_at < start_at):
+            raise ValueError("缺口时间范围无效")
+        source = source.strip()[:80]
+        if not source:
+            raise ValueError("缺口来源不能为空")
+        now = _utc_now()
+        gap_id: str
+        with closing(self._connect()) as connection, connection:
+            existing = connection.execute(
+                """SELECT * FROM message_gaps
+                   WHERE group_id = ? AND end_at IS NULL
+                     AND status IN ('open', 'paused', 'repairing')
+                   ORDER BY start_at LIMIT 1""",
+                (group_id,),
+            ).fetchone()
+            if existing is not None:
+                if confidence == "confirmed" and existing["confidence"] == "suspected":
+                    connection.execute(
+                        """UPDATE message_gaps SET confidence = 'confirmed',
+                                  source = ?, updated_at = ? WHERE gap_id = ?""",
+                        (source, now, existing["gap_id"]),
+                    )
+                gap_id = str(existing["gap_id"])
+            else:
+                before_id = self._message_boundary(connection, group_id, start_at, before=True)
+                after_id = (
+                    self._message_boundary(connection, group_id, end_at, before=False)
+                    if end_at is not None
+                    else None
+                )
+                gap_id = f"gap_{secrets.token_urlsafe(12)}"
+                connection.execute(
+                    """INSERT INTO message_gaps (
+                           gap_id, group_id, start_at, end_at, confidence, source,
+                           status, before_message_id, after_message_id, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)""",
+                    (
+                        gap_id,
+                        group_id,
+                        start_at,
+                        end_at,
+                        confidence,
+                        source,
+                        before_id,
+                        after_id,
+                        now,
+                        now,
+                    ),
+                )
+        return self.message_gap(gap_id)
+
+    def create_message_gaps_for_all(
+        self,
+        *,
+        start_at: int,
+        confidence: str,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            self.create_message_gap(
+                group_id,
+                start_at=start_at,
+                end_at=None,
+                confidence=confidence,
+                source=source,
+            )
+            for group_id in self.collected_group_ids()
+        ]
+
+    def close_open_message_gaps(
+        self, *, end_at: int, automatic_only: bool = True
+    ) -> list[dict[str, Any]]:
+        source_clause = (
+            " AND source IN "
+            "('sse_disconnect', 'heartbeat_degraded', 'heartbeat_timeout', "
+            "'unclean_restart', 'account_switch', 'collection_pause')"
+            if automatic_only
+            else ""
+        )
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """SELECT gap_id, group_id FROM message_gaps
+                   WHERE end_at IS NULL AND status IN ('open', 'paused')"""
+                + source_clause
+            ).fetchall()
+            for row in rows:
+                after_id = self._message_boundary(
+                    connection, str(row["group_id"]), end_at, before=False
+                )
+                connection.execute(
+                    """UPDATE message_gaps SET end_at = ?, after_message_id = ?,
+                              updated_at = ? WHERE gap_id = ?""",
+                    (end_at, after_id, _utc_now(), row["gap_id"]),
+                )
+        return [self.message_gap(str(row["gap_id"])) for row in rows]
+
+    def refresh_message_gap_boundaries(self, gap_id: str) -> dict[str, Any]:
+        gap = self.message_gap(gap_id)
+        with closing(self._connect()) as connection, connection:
+            before_id = gap["before_message_id"] or self._message_boundary(
+                connection, str(gap["group_id"]), int(gap["start_at"]), before=True
+            )
+            after_id = gap["after_message_id"]
+            if after_id is None and gap["end_at"] is not None:
+                after_id = self._message_boundary(
+                    connection, str(gap["group_id"]), int(gap["end_at"]), before=False
+                )
+            connection.execute(
+                """UPDATE message_gaps SET before_message_id = ?, after_message_id = ?,
+                          updated_at = ? WHERE gap_id = ?""",
+                (before_id, after_id, _utc_now(), gap_id),
+            )
+        return self.message_gap(gap_id)
+
+    def message_gap(self, gap_id: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM message_gaps WHERE gap_id = ?", (gap_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError("消息缺口不存在")
+        return self._gap_from_row(row)
+
+    def list_message_gaps(
+        self,
+        *,
+        group_id: str | None = None,
+        unresolved_only: bool = False,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit 必须在 1 到 1000 之间")
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if group_id is not None:
+            clauses.append("group_id = ?")
+            parameters.append(group_id)
+        if unresolved_only:
+            clauses.append("status NOT IN ('repaired', 'accepted')")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM message_gaps {where}
+                    ORDER BY start_at DESC, created_at DESC LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [self._gap_from_row(row) for row in rows]
+
+    def message_gaps_overlapping(
+        self, group_id: str, *, start_at: int, end_at: int
+    ) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT * FROM message_gaps
+                   WHERE group_id = ?
+                     AND status NOT IN ('repaired', 'accepted')
+                     AND start_at <= ?
+                     AND COALESCE(end_at, 9223372036854775807) >= ?
+                   ORDER BY start_at""",
+                (group_id, end_at, start_at),
+            ).fetchall()
+        return [self._gap_from_row(row) for row in rows]
+
+    def unresolved_message_gaps_before(
+        self, group_id: str, *, timestamp: int
+    ) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT * FROM message_gaps
+                   WHERE group_id = ?
+                     AND status NOT IN ('repaired', 'accepted')
+                     AND COALESCE(end_at, start_at) < ?
+                   ORDER BY start_at DESC""",
+                (group_id, timestamp),
+            ).fetchall()
+        return [self._gap_from_row(row) for row in rows]
+
+    def update_message_gap_repair(
+        self,
+        gap_id: str,
+        *,
+        status: str,
+        repair_cursor: str | None = None,
+        increment_pages: bool = False,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"open", "paused", "repairing", "repaired", "unverified"}:
+            raise ValueError("无效的缺口修复状态")
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE message_gaps SET status = ?, repair_cursor = ?,
+                          pages_attempted = pages_attempted + ?,
+                          last_error = ?, updated_at = ?
+                   WHERE gap_id = ?""",
+                (
+                    status,
+                    repair_cursor,
+                    int(increment_pages),
+                    error[:500] if error else None,
+                    _utc_now(),
+                    gap_id,
+                ),
+            )
+            if result.rowcount != 1:
+                raise KeyError("消息缺口不存在")
+        return self.message_gap(gap_id)
+
+    def accept_message_gap(self, gap_id: str, *, reason: str) -> dict[str, Any]:
+        text = reason.strip()
+        if not text:
+            raise ValueError("接受缺口必须填写原因")
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE message_gaps SET status = 'accepted',
+                          accepted_reason = ?, updated_at = ?
+                   WHERE gap_id = ? AND status != 'repaired'""",
+                (text[:500], _utc_now(), gap_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("缺口不存在或已经修复")
+        return self.message_gap(gap_id)
+
+    def pause_incomplete_gap_repairs(self) -> int:
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                """UPDATE message_gaps SET status = 'paused',
+                          last_error = '应用重启后需要人工恢复', updated_at = ?
+                   WHERE status = 'repairing'""",
+                (_utc_now(),),
+            )
+        return int(result.rowcount)
+
+    def record_onebot_action(self, record: dict[str, Any]) -> None:
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO onebot_action_audit (
+                       action, source, outcome, latency_ms, error_type, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    str(record.get("action") or "unknown")[:80],
+                    str(record.get("source") or "unspecified")[:80],
+                    str(record.get("outcome") or "error"),
+                    max(0.0, float(record.get("latency_ms") or 0)),
+                    str(record.get("error_type"))[:120] if record.get("error_type") else None,
+                    str(record.get("created_at") or _utc_now()),
+                ),
+            )
+            connection.execute("DELETE FROM onebot_action_audit WHERE created_at < ?", (cutoff,))
+
+    def onebot_action_summary(self) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        result: dict[str, Any] = {}
+        with closing(self._connect()) as connection:
+            for label, delta in (
+                ("last_24_hours", timedelta(hours=24)),
+                ("last_7_days", timedelta(days=7)),
+            ):
+                rows = connection.execute(
+                    """SELECT action, source, outcome, count(*) AS calls
+                       FROM onebot_action_audit WHERE created_at >= ?
+                       GROUP BY action, source, outcome
+                       ORDER BY action, source, outcome""",
+                    ((now - delta).isoformat(),),
+                ).fetchall()
+                result[label] = [dict(row) for row in rows]
+        return result
+
+    def history_actions_in_last_24_hours(self) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT count(*) FROM onebot_action_audit
+                   WHERE action = 'get_group_msg_history' AND created_at >= ?""",
+                (cutoff,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    def _account_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def register_qq_account(self, account_id: str, *, label: str) -> dict[str, Any]:
+        if not account_id.isdigit():
+            raise ValueError("QQ 号只能包含数字")
+        text = label.strip()
+        if not text or len(text) > 40:
+            raise ValueError("账号标签必须是 1 到 40 字")
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO qq_accounts (
+                       account_id, label, status, created_at, updated_at
+                   ) VALUES (?, ?, 'registered', ?, ?)
+                   ON CONFLICT (account_id) DO UPDATE SET
+                       label = excluded.label,
+                       status = CASE WHEN qq_accounts.status = 'disabled'
+                                     THEN 'registered' ELSE qq_accounts.status END,
+                       updated_at = excluded.updated_at""",
+                (account_id, text, now, now),
+            )
+            groups = connection.execute(
+                """SELECT DISTINCT group_key FROM group_member_roles
+                   WHERE role = 'player'"""
+            ).fetchall()
+            connection.executemany(
+                """INSERT OR IGNORE INTO group_member_roles (
+                       group_key, qq_user_id, role, display_name
+                   ) VALUES (?, ?, 'player', ?)""",
+                [(str(row["group_key"]), account_id, text) for row in groups],
+            )
+        return self.qq_account(account_id)
+
+    def qq_account(self, account_id: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM qq_accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError("QQ 账号尚未登记")
+        return self._account_from_row(row)
+
+    def list_qq_accounts(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT * FROM qq_accounts
+                   ORDER BY status = 'active' DESC, created_at, account_id"""
+            ).fetchall()
+        return [self._account_from_row(row) for row in rows]
+
+    def ensure_active_qq_account(self, account_id: str) -> dict[str, Any]:
+        try:
+            self.qq_account(account_id)
+        except KeyError:
+            self.register_qq_account(account_id, label=f"QQ {account_id}")
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            active = connection.execute(
+                "SELECT account_id FROM qq_accounts WHERE status = 'active'"
+            ).fetchone()
+            if active is None:
+                connection.execute(
+                    """UPDATE qq_accounts SET status = 'active',
+                              last_activated_at = ?, updated_at = ?
+                       WHERE account_id = ?""",
+                    (now, now, account_id),
+                )
+            elif str(active["account_id"]) != account_id:
+                connection.execute(
+                    """UPDATE qq_accounts SET status = 'pending', updated_at = ?
+                       WHERE account_id = ?""",
+                    (now, account_id),
+                )
+        return self.qq_account(account_id)
+
+    def active_qq_account(self) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT * FROM qq_accounts WHERE status = 'active'").fetchone()
+        return self._account_from_row(row) if row else None
+
+    def create_qq_account_switch(
+        self, target_account_id: str, *, requested_by: str
+    ) -> dict[str, Any]:
+        target = self.qq_account(target_account_id)
+        if target["status"] == "disabled":
+            raise ValueError("目标 QQ 账号已停用")
+        current = self.active_qq_account()
+        if current and current["account_id"] == target_account_id:
+            raise ValueError("目标 QQ 已经是当前活跃账号")
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        failed_cutoff = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+        with closing(self._connect()) as connection, connection:
+            stale_cutoff = (datetime.now(UTC) - timedelta(minutes=15)).isoformat()
+            connection.execute(
+                """UPDATE qq_account_switches SET status = 'cancelled',
+                          completed_at = ?, error = '确认链接超时'
+                   WHERE status = 'requested' AND requested_at < ?""",
+                (_utc_now(), stale_cutoff),
+            )
+            in_progress = connection.execute(
+                """SELECT 1 FROM qq_account_switches
+                   WHERE status IN ('requested', 'host_pending', 'awaiting_login')"""
+            ).fetchone()
+            if in_progress:
+                raise ValueError("已有账号切换正在进行")
+            recent_failure = connection.execute(
+                """SELECT requested_at FROM qq_account_switches
+                   WHERE target_account_id = ? AND status = 'failed'
+                     AND requested_at >= ? ORDER BY requested_at DESC LIMIT 1""",
+                (target_account_id, failed_cutoff),
+            ).fetchone()
+            if recent_failure:
+                raise ValueError("目标账号登录失败后正在 30 分钟冷却中")
+            failures = connection.execute(
+                """SELECT count(*) FROM qq_account_switches
+                   WHERE target_account_id = ? AND status = 'failed'
+                     AND requested_at >= ?""",
+                (target_account_id, cutoff),
+            ).fetchone()
+            if int(failures[0]) >= 3:
+                raise ValueError("目标账号 24 小时内失败次数已达 3 次")
+            switch_id = f"sw_{secrets.token_urlsafe(12)}"
+            connection.execute(
+                """INSERT INTO qq_account_switches (
+                       switch_id, from_account_id, target_account_id, status,
+                       requested_by, requested_at
+                   ) VALUES (?, ?, ?, 'requested', ?, ?)""",
+                (
+                    switch_id,
+                    str(current["account_id"]) if current else None,
+                    target_account_id,
+                    requested_by[:200],
+                    _utc_now(),
+                ),
+            )
+        return self.qq_account_switch(switch_id)
+
+    def qq_account_switch(self, switch_id: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM qq_account_switches WHERE switch_id = ?", (switch_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError("账号切换记录不存在")
+        return dict(row)
+
+    def update_qq_account_switch(
+        self, switch_id: str, *, status: str, error: str | None = None
+    ) -> dict[str, Any]:
+        if status not in {
+            "host_pending",
+            "awaiting_login",
+            "completed",
+            "failed",
+            "cancelled",
+        }:
+            raise ValueError("无效的账号切换状态")
+        now = _utc_now()
+        switch = self.qq_account_switch(switch_id)
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """UPDATE qq_account_switches SET status = ?,
+                          confirmed_at = CASE WHEN ? = 'host_pending'
+                                              THEN COALESCE(confirmed_at, ?)
+                                              ELSE confirmed_at END,
+                          completed_at = CASE WHEN ? IN ('completed', 'failed', 'cancelled')
+                                              THEN ? ELSE completed_at END,
+                          error = ?
+                   WHERE switch_id = ?""",
+                (
+                    status,
+                    status,
+                    now,
+                    status,
+                    now,
+                    error[:500] if error else None,
+                    switch_id,
+                ),
+            )
+            if status == "awaiting_login":
+                connection.execute(
+                    """UPDATE qq_accounts SET status = 'pending', updated_at = ?
+                       WHERE account_id = ?""",
+                    (now, switch["target_account_id"]),
+                )
+            if status == "completed":
+                connection.execute(
+                    """UPDATE qq_accounts SET status = 'registered', updated_at = ?
+                       WHERE status = 'active'""",
+                    (now,),
+                )
+                connection.execute(
+                    """UPDATE qq_accounts SET status = 'active',
+                              last_activated_at = ?, updated_at = ?
+                       WHERE account_id = ?""",
+                    (now, now, switch["target_account_id"]),
+                )
+        return self.qq_account_switch(switch_id)
+
+    def latest_qq_account_switch(self) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT * FROM qq_account_switches
+                   ORDER BY requested_at DESC LIMIT 1"""
+            ).fetchone()
+        return dict(row) if row else None
 
     def upsert(self, messages: Iterable[ChatMessage]) -> tuple[int, int]:
         batch = list(messages)
@@ -943,6 +1658,15 @@ class MessageStore:
             ).fetchone()
         return str(row[0]) if row else None
 
+    def message_seq(self, group_id: str, message_id: str) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT message_seq FROM messages
+                   WHERE group_id = ? AND message_id = ?""",
+                (group_id, message_id),
+            ).fetchone()
+        return str(row[0]) if row else None
+
     def oldest_message_seq(self, group_id: str) -> str | None:
         state = self.state(group_id)
         if state["oldest_message_seq"]:
@@ -1091,7 +1815,7 @@ class MessageStore:
                 "SELECT version FROM groups WHERE group_key = ? AND whitelisted = 1", (group_key,)
             ).fetchone()
             if row is None:
-                raise KeyError("群不在白名单中")
+                raise KeyError("群尚未授权 AI 访问")
             connection.execute(
                 """INSERT INTO characters (
                        group_key, source_filename, source_sha256, source_path,

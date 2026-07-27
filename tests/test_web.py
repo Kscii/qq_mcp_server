@@ -13,7 +13,7 @@ from test_cards import make_card
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.mcp_server import create_http_app, create_mcp_servers
-from qq_mcp_server.models import ChatMessage, NoteOperation
+from qq_mcp_server.models import ROLEPLAY_GUIDANCE_MAX_LENGTH, ChatMessage, NoteOperation
 from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.store import MessageStore
 
@@ -71,8 +71,9 @@ def dashboard_message(message_id: str, text: str, *, group_id: str = "2") -> Cha
 
 async def test_whitelist_web_page_and_group_route_guard(config: AppConfig) -> None:
     store, _, _, app = services(config)
+    store.upsert_group_candidate("2", "测试群", source="group_message_event")
     token = store.issue_capability(
-        kind="group_whitelist", group_key=None, issued_to="local", ttl_seconds=600
+        kind="group_access", group_key=None, issued_to="local", ttl_seconds=600
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -216,7 +217,7 @@ async def test_campaign_dashboard_renders_all_read_only_sections_and_escapes_htm
     assert "<script>alert(1)</script>" not in overview.text
     assert guidance in guidance_page.text.replace("&lt;", "<").replace("&gt;", ">")
     assert "&lt;img src=x onerror=alert(1)&gt;" in guidance_page.text
-    assert f"{len(guidance)} / 4096 字" in guidance_page.text
+    assert f"{len(guidance)} / {ROLEPLAY_GUIDANCE_MAX_LENGTH} 字" in guidance_page.text
     assert "vitals/hp/current" in card_page.text
     assert "8" in card_page.text
     assert "/private/never-show-this.xlsx" not in card_page.text
@@ -330,11 +331,11 @@ async def test_event_candidate_can_be_directly_verified_before_whitelist(
         source="group_message_event",
     )
     token = store.issue_capability(
-        kind="group_whitelist", group_key=None, issued_to="local", ttl_seconds=600
+        kind="group_access", group_key=None, issued_to="local", ttl_seconds=600
     )
     store.set_capability_payload(
         token,
-        kind="group_whitelist",
+        kind="group_access",
         payload={"group_id": "3"},
     )
     transport = httpx.ASGITransport(app=app)
@@ -384,13 +385,53 @@ async def test_napcat_launcher_hides_token_until_confirmed_redirect(
     assert redirected.headers["cache-control"] == "no-store"
 
 
+async def test_account_registration_and_switch_confirmation_use_fixed_request(
+    config: AppConfig,
+) -> None:
+    store, _, _, app = services(config)
+    registration = store.issue_capability(
+        kind="qq_account_registration",
+        group_key=None,
+        issued_to="local",
+        ttl_seconds=600,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        registered = await client.post(
+            f"/admin/accounts/{registration}",
+            data={"account_id": "9", "label": "备用账号"},
+        )
+        switch = store.create_qq_account_switch("9", requested_by="local")
+        confirmation = store.issue_capability(
+            kind="qq_account_switch",
+            group_key=None,
+            issued_to="local",
+            ttl_seconds=600,
+        )
+        store.set_capability_payload(
+            confirmation,
+            kind="qq_account_switch",
+            payload={"switch_id": switch["switch_id"]},
+        )
+        preview = await client.get(f"/admin/account-switch/{confirmation}")
+        confirmed = await client.post(f"/admin/account-switch/{confirmation}")
+
+    assert registered.status_code == 200
+    assert preview.status_code == confirmed.status_code == 200
+    request = config.napcat_control_dir / "switch-napcat-account.request"
+    assert request.is_file()
+    assert request.stat().st_mode & 0o777 == 0o600
+    assert store.qq_account_switch(str(switch["switch_id"]))["status"] == "host_pending"
+    assert store.runtime_status("collection_control")["status"] == "paused_manual"
+
+
 async def test_recovery_requires_post_and_only_writes_fixed_request(
     config: AppConfig,
 ) -> None:
     store, _, _, app = services(config)
     store.set_runtime_status(
-        "sync_scheduler",
-        {"ok": False, "last_error": "OneBotTransportError: 连接失败"},
+        "sse",
+        {"connected": False, "last_error": "OneBotTransportError: 连接失败"},
     )
     token = store.issue_capability(
         kind="napcat_recovery", group_key=None, issued_to="local", ttl_seconds=600

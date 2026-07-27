@@ -46,10 +46,11 @@ from qq_mcp_server import __version__
 from qq_mcp_server.ai_instructions import ADMIN_INSTRUCTIONS, GROUP_INSTRUCTIONS, PROMPT_VERSION
 from qq_mcp_server.cards import CharacterCardService, roleplay_view
 from qq_mcp_server.config import AppConfig, ConfigError
+from qq_mcp_server.gaps import GapRepairService
 from qq_mcp_server.models import ROLEPLAY_GUIDANCE_MAX_LENGTH, CardOperation, NoteOperation
-from qq_mcp_server.onebot import OneBotClient
+from qq_mcp_server.onebot import OneBotClient, onebot_action_source
 from qq_mcp_server.rules import RuleIndex
-from qq_mcp_server.runtime import NapCatRuntime, sync_freshness
+from qq_mcp_server.runtime import NapCatRuntime
 from qq_mcp_server.store import MessageStore, VersionConflictError
 from qq_mcp_server.web import (
     admin_page_url,
@@ -57,6 +58,8 @@ from qq_mcp_server.web import (
     card_upload_url,
     napcat_recovery_url,
     napcat_webui_url,
+    qq_account_registration_url,
+    qq_account_switch_url,
     register_web_routes,
 )
 
@@ -421,19 +424,18 @@ def _group_meta(group: dict[str, Any]) -> dict[str, Any]:
         "qq_group_name": group["qq_group_name"],
         "module_title": group["module_title"] or None,
         "display_label": group["display_label"] or None,
-        "history_since": group.get("history_since") or None,
     }
 
 
 def _readiness(store: MessageStore, rules: RuleIndex, group: dict[str, Any]) -> dict[str, Any]:
     roles = store.member_roles(str(group["group_key"]))
     character = store.character(str(group["group_key"]))
-    sync = store.state(str(group["qq_group_id"]))
+    message_state = store.state(str(group["qq_group_id"]))
     rule_health = rules.health()
     checks = [
         {
-            "id": "whitelist",
-            "label": "QQ群已加入采集白名单",
+            "id": "access",
+            "label": "已授权 AI 读取本 QQ 群",
             "complete": bool(group["whitelisted"]),
         },
         {
@@ -463,8 +465,8 @@ def _readiness(store: MessageStore, rules: RuleIndex, group: dict[str, Any]) -> 
         },
         {
             "id": "messages",
-            "label": "最近 QQ 消息已同步；完整历史可继续后台回填",
-            "complete": bool(sync["recent_ready"]),
+            "label": "群消息由常开 SSE 实时采集，不执行自动历史轮询",
+            "complete": True,
         },
     ]
     blocking = [item["id"] for item in checks if not item["complete"] and item["id"] != "messages"]
@@ -488,19 +490,19 @@ def _readiness(store: MessageStore, rules: RuleIndex, group: dict[str, Any]) -> 
             if character
             else None
         ),
-        "sync": sync,
+        "message_state": message_state,
         "rules": rule_health,
     }
 
 
 def _setup_instruction(check_id: str) -> str:
     return {
-        "whitelist": "通过 admin.open_group_whitelist 打开网页并加入群。",
+        "access": "通过 admin.open_group_access 打开网页并授权 AI 读取该群。",
         "module": "调用 admin.update_group_profile 设置 module_title。",
         "player": "先列出成员，再调用 admin.set_member_roles 绑定 player QQ。",
         "card": "连接该群 App，调用 trpg.begin_character_card_upload。",
         "rules": "在服务器离线运行 build-rules 并挂载只读索引。",
-        "messages": "保持 NapCat 在线，等待最近同步完成。",
+        "messages": "保持 NapCat SSE 在线；若有缺口，在管理 App 中人工修复。",
     }.get(check_id, "按检查项完成配置。")
 
 
@@ -536,6 +538,7 @@ def create_mcp_servers(
     *,
     group_key_override: str | None = None,
     runtime: NapCatRuntime | None = None,
+    gap_repair: GapRepairService | None = None,
 ) -> tuple[FastMCP, FastMCP]:
     runtime = runtime or NapCatRuntime(
         config,
@@ -543,6 +546,7 @@ def create_mcp_servers(
         store,
         os.environ.get("ONEBOT_ACCESS_TOKEN", "local-test-token"),
     )
+    gap_repair = gap_repair or GapRepairService(config, client, store)
     auth = _auth_provider(config, store)
     auth_check = _authorized_email(config, auth)
     admin = FastMCP(
@@ -564,7 +568,9 @@ def create_mcp_servers(
     timezone = ZoneInfo(config.timezone)
 
     def present(messages: list[dict[str, Any]], roles: dict[str, Any]) -> list[dict[str, Any]]:
-        player = roles["player_qq_user_id"]
+        players = set(roles.get("player_qq_user_ids") or [])
+        if not players and roles.get("player_qq_user_id"):
+            players.add(str(roles["player_qq_user_id"]))
         kp = set(roles["kp_qq_user_ids"])
         dice = set(roles["dice_bot_qq_user_ids"])
         result: list[dict[str, Any]] = []
@@ -572,7 +578,7 @@ def create_mcp_servers(
             sender_id = str(message["sender_id"])
             sender_role = (
                 "player"
-                if sender_id == player
+                if sender_id in players
                 else "kp"
                 if sender_id in kp
                 else "dice_bot"
@@ -591,16 +597,16 @@ def create_mcp_servers(
         return result
 
     @admin.tool(
-        name="admin.open_group_whitelist",
+        name="admin.open_group_access",
         description=(
-            "当用户需要把 QQ 群加入或移出消息采集白名单时使用。"
-            "返回短期有效的最小网页；启用或停用跑团时不要调用本工具。"
+            "当用户需要允许或禁止 AI 读取某个已采集 QQ 群时使用。"
+            "所有群仍会通过 SSE 入库；本工具只改变 MCP 访问权限。"
         ),
         annotations=_WRITE,
         auth=auth_check,
         run_in_thread=False,
     )
-    async def open_group_whitelist(
+    async def open_group_access(
         group_id: Annotated[
             str | None,
             Field(description="可选 QQ 群号；已通过 admin.probe_group 验证时可直接预选该群。"),
@@ -609,7 +615,7 @@ def create_mcp_servers(
         if group_id is not None and not group_id.isdigit():
             raise ValueError("group_id 只能包含数字")
         token = store.issue_capability(
-            kind="group_whitelist",
+            kind="group_access",
             group_key=None,
             issued_to=_request_email(),
             ttl_seconds=config.upload_token_ttl_seconds,
@@ -617,20 +623,20 @@ def create_mcp_servers(
         if group_id:
             store.set_capability_payload(
                 token,
-                kind="group_whitelist",
+                kind="group_access",
                 payload={"group_id": group_id},
             )
         return {
             "url": admin_page_url(config, token),
             "expires_in_seconds": config.upload_token_ttl_seconds,
-            "next_actions": [{"label": "打开白名单网页", "instruction": "选择一个群并确认。"}],
+            "next_actions": [{"label": "打开群访问授权网页", "instruction": "选择一个群并确认。"}],
         }
 
     @admin.tool(
         name="admin.get_napcat_status",
         description=(
-            "从本地缓存诊断 QQ 采集熔断、OneBot 调用统计、SSE、强制群列表和各白名单群"
-            "消息新鲜度。不会为了诊断额外请求 QQ，也不返回任何 Token。"
+            "从本地缓存诊断 QQ 账号、SSE 心跳、消息缺口、OneBot 调用审计和群采集状态。"
+            "不会为了诊断额外请求 QQ，也不返回任何 Token。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -638,6 +644,265 @@ def create_mcp_servers(
     )
     async def get_napcat_status() -> dict[str, Any]:
         return await runtime.get_status()
+
+    @admin.tool(
+        name="admin.list_message_gaps",
+        description=(
+            "查看 SSE 断线、QQ 掉线、应用重启或写入失败留下的消息缺口。"
+            "本工具只读本地数据库，不调用 QQ。"
+        ),
+        annotations=_READ_ONLY,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def list_message_gaps(
+        group_key: Annotated[
+            str | None,
+            Field(description="可选的固定群标识；省略时列出所有群的缺口。"),
+        ] = None,
+        unresolved_only: Annotated[
+            bool,
+            Field(description="true 只返回尚未修复或接受的缺口。"),
+        ] = True,
+    ) -> dict[str, Any]:
+        group_id = None
+        if group_key is not None:
+            group_id = str(store.get_group(group_key)["qq_group_id"])
+        return {
+            "gaps": store.list_message_gaps(
+                group_id=group_id,
+                unresolved_only=unresolved_only,
+            ),
+            "history_requests_last_24_hours": store.history_actions_in_last_24_hours(),
+            "history_request_limit_per_24_hours": 30,
+        }
+
+    @admin.tool(
+        name="admin.create_message_gap",
+        description=(
+            "仅在用户明确指出某段群消息可能缺失时创建人工缺口；只记录区间，不会立即调用历史接口。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def create_message_gap(
+        group_key: _GroupKey,
+        start_at: Annotated[
+            str,
+            Field(description="缺口开始时间，必须是包含时区的 ISO 8601。"),
+        ],
+        end_at: Annotated[
+            str,
+            Field(description="缺口结束时间，必须是包含时区的 ISO 8601。"),
+        ],
+    ) -> dict[str, Any]:
+        def timestamp(value: str) -> int:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                raise ValueError("缺口时间必须包含时区")
+            return int(parsed.timestamp())
+
+        group = store.get_group(group_key)
+        gap = store.create_message_gap(
+            str(group["qq_group_id"]),
+            start_at=timestamp(start_at),
+            end_at=timestamp(end_at),
+            confidence="suspected",
+            source="user_reported",
+        )
+        return {"gap": gap, "history_requested": False}
+
+    @admin.tool(
+        name="admin.control_message_gap_repair",
+        description=(
+            "仅在用户明确要求后启动、暂停或恢复一个已登记缺口的慢速历史修复。"
+            "全局最多每 60 秒一页、滚动 24 小时最多 30 页，错误后立即暂停。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def control_message_gap_repair(
+        gap_id: Annotated[str, Field(description="由 admin.list_message_gaps 返回的缺口标识。")],
+        action: Annotated[
+            str,
+            Field(description="只能是 start、pause 或 resume。"),
+        ],
+    ) -> dict[str, Any]:
+        if action in {"start", "resume"}:
+            gap = gap_repair.start(gap_id)
+        elif action == "pause":
+            gap = gap_repair.pause(gap_id)
+        else:
+            raise ValueError("action 只能是 start、pause 或 resume")
+        return {
+            "gap": gap,
+            "history_requests_last_24_hours": store.history_actions_in_last_24_hours(),
+        }
+
+    @admin.tool(
+        name="admin.accept_message_gap",
+        description=(
+            "仅在用户明确决定不再修复某个缺口时使用。接受不等于修复；"
+            "后续上下文仍会显示数据完整性警告。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def accept_message_gap(
+        gap_id: Annotated[str, Field(description="要人工接受的消息缺口标识。")],
+        reason: Annotated[str, Field(description="用户接受该缺口的原因，最多 500 字。")],
+    ) -> dict[str, Any]:
+        return {"gap": store.accept_message_gap(gap_id, reason=reason)}
+
+    @admin.tool(
+        name="admin.list_qq_accounts",
+        description=(
+            "列出已登记 QQ 账号、当前活跃账号和最近一次切换状态。只读取本地状态，不调用 QQ。"
+        ),
+        annotations=_READ_ONLY,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def list_qq_accounts() -> dict[str, Any]:
+        return {
+            "accounts": store.list_qq_accounts(),
+            "active_account": store.active_qq_account(),
+            "latest_switch": store.latest_qq_account_switch(),
+        }
+
+    @admin.tool(
+        name="admin.open_qq_account_registration",
+        description=(
+            "当用户明确要求加入备用 QQ 号时调用。返回十分钟有效的最小网页，"
+            "只登记 QQ 号和标签，不收集密码也不立即切换。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def open_qq_account_registration() -> dict[str, Any]:
+        token = store.issue_capability(
+            kind="qq_account_registration",
+            group_key=None,
+            issued_to=_request_email(),
+            ttl_seconds=config.upload_token_ttl_seconds,
+        )
+        return {
+            "url": qq_account_registration_url(config, token),
+            "expires_in_seconds": config.upload_token_ttl_seconds,
+        }
+
+    @admin.tool(
+        name="admin.begin_qq_account_switch",
+        description=(
+            "仅在用户明确选择已登记目标 QQ 后调用。返回一次性浏览器确认页；"
+            "确认后宿主机只运行目标账号的一个 NapCat 实例，并保持采集暂停等待登录。"
+        ),
+        annotations=_DESTRUCTIVE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def begin_qq_account_switch(
+        target_account_id: Annotated[
+            str,
+            Field(description="由 admin.list_qq_accounts 返回的已登记目标 QQ 号。"),
+        ],
+    ) -> dict[str, Any]:
+        switch = store.create_qq_account_switch(
+            target_account_id,
+            requested_by=_request_email(),
+        )
+        token = store.issue_capability(
+            kind="qq_account_switch",
+            group_key=None,
+            issued_to=_request_email(),
+            ttl_seconds=config.upload_token_ttl_seconds,
+        )
+        store.set_capability_payload(
+            token,
+            kind="qq_account_switch",
+            payload={"switch_id": switch["switch_id"]},
+        )
+        return {
+            "switch": switch,
+            "url": qq_account_switch_url(config, token),
+            "expires_in_seconds": config.upload_token_ttl_seconds,
+            "requires_browser_confirmation": True,
+        }
+
+    @admin.tool(
+        name="admin.get_qq_account_switch_status",
+        description=("查看某次账号切换的应用和宿主机状态；只读取本地文件与数据库，不调用 QQ。"),
+        annotations=_READ_ONLY,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def get_qq_account_switch_status(
+        switch_id: Annotated[
+            str,
+            Field(description="由 admin.begin_qq_account_switch 返回的切换标识。"),
+        ],
+    ) -> dict[str, Any]:
+        return runtime.account_switch_status(switch_id)
+
+    @admin.tool(
+        name="admin.complete_qq_account_switch",
+        description=(
+            "仅在用户已完成目标 QQ 登录后调用。只执行一次登录信息和一次强制群列表读取；"
+            "账号正确且包含全部启用跑团群时恢复 SSE。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def complete_qq_account_switch(
+        switch_id: Annotated[
+            str,
+            Field(description="等待登录中的账号切换标识。"),
+        ],
+    ) -> dict[str, Any]:
+        try:
+            return await runtime.complete_account_switch(switch_id)
+        except Exception as error:
+            return _error(
+                "QQ_ACCOUNT_SWITCH_NOT_COMPLETE",
+                str(error),
+                next_actions=[
+                    {
+                        "label": "打开 NapCat 登录",
+                        "instruction": "调用 admin.open_napcat_webui，确认目标账号已经登录。",
+                    }
+                ],
+            )
+
+    @admin.tool(
+        name="admin.cancel_qq_account_switch",
+        description=(
+            "仅在用户明确放弃等待中的目标账号时调用。只取消本地切换流程并保持采集暂停，"
+            "不会自动切回旧账号；之后可以人工选择另一个已登记账号。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def cancel_qq_account_switch(
+        switch_id: Annotated[str, Field(description="要取消的等待中账号切换标识。")],
+        reason: Annotated[str, Field(description="用户取消切换的原因，最多 500 字。")],
+    ) -> dict[str, Any]:
+        switch = store.qq_account_switch(switch_id)
+        if switch["status"] not in {"requested", "awaiting_login"}:
+            raise ValueError("该账号切换当前不能取消")
+        return {
+            "switch": store.update_qq_account_switch(
+                switch_id,
+                status="cancelled",
+                error=reason,
+            ),
+            "collection_remains_paused": True,
+        }
 
     @admin.tool(
         name="admin.pause_qq_collection",
@@ -652,7 +917,7 @@ def create_mcp_servers(
     async def pause_qq_collection(
         reason: Annotated[str, Field(description="用户给出的暂停原因，最多 500 字。")],
     ) -> dict[str, Any]:
-        return {"collection_control": runtime.manager.pause_manual(reason)}
+        return {"collection_control": runtime.pause_collection(reason)}
 
     @admin.tool(
         name="admin.resume_qq_collection",
@@ -666,7 +931,7 @@ def create_mcp_servers(
     )
     async def resume_qq_collection() -> dict[str, Any]:
         try:
-            return await runtime.manager.resume()
+            return await runtime.resume_collection()
         except Exception as error:
             return _error(
                 "QQ_COLLECTION_RESUME_FAILED",
@@ -682,8 +947,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.refresh_group_registry",
         description=(
-            "仅在用户需要立即查看新加入群或怀疑群列表缓存陈旧时调用。强制执行一次"
-            "no_cache 群列表读取并更新候选群；至少 60 秒冷却，不会重启 NapCat。"
+            "仅在用户明确要求核对当前账号加入的群时调用。执行一次登录校验和一次"
+            "no_cache 群列表读取；至少 60 秒冷却，不会自动周期调用。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -696,8 +961,8 @@ def create_mcp_servers(
             "groups": groups,
             "next_actions": [
                 {
-                    "label": "维护白名单",
-                    "instruction": "需要加入或移出白名单时调用 admin.open_group_whitelist。",
+                    "label": "维护 AI 访问授权",
+                    "instruction": "需要授权或撤销 AI 访问时调用 admin.open_group_access。",
                 }
             ],
         }
@@ -706,7 +971,7 @@ def create_mcp_servers(
         name="admin.probe_group",
         description=(
             "用户给出明确 QQ 群号但强制群列表中找不到时调用。"
-            "通过群资料、当前账号成员身份或可读历史验证，不会自动加入白名单。"
+            "通过已收到的 SSE 事件、群资料或当前账号成员身份验证；不会读取群历史。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -719,9 +984,9 @@ def create_mcp_servers(
         if result["status"] in {"verified", "group_registry_stale"}:
             result["next_actions"] = [
                 {
-                    "label": "人工确认白名单",
+                    "label": "人工确认 AI 访问",
                     "instruction": (
-                        f"用户确认后调用 admin.open_group_whitelist，group_id={group_id}。"
+                        f"用户确认后调用 admin.open_group_access，group_id={group_id}。"
                     ),
                 }
             ]
@@ -779,12 +1044,11 @@ def create_mcp_servers(
                 "NAPCAT_RESTART_NOT_NEEDED",
                 "NapCat 未处于持续不可达状态；群列表缺失、同步陈旧或人工暂停不能作为重启理由。",
             )
-        scheduler_updated = status["sync_scheduler"].get("updated_at")
-        if isinstance(scheduler_updated, str):
+        sse_updated = status["sse"].get("updated_at")
+        if isinstance(sse_updated, str):
             try:
                 error_age = (
-                    datetime.now().astimezone()
-                    - datetime.fromisoformat(scheduler_updated).astimezone()
+                    datetime.now().astimezone() - datetime.fromisoformat(sse_updated).astimezone()
                 ).total_seconds()
             except ValueError:
                 error_age = 0
@@ -809,8 +1073,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.list_groups",
         description=(
-            "需要了解可管理的群时优先调用。列出全部白名单群、每群固定 MCP 地址、"
-            "配置完整度、同步进度和跑团启用状态。"
+            "需要了解可管理的群时优先调用。列出已获 AI 访问授权的群、固定 MCP 地址、"
+            "配置完整度、消息数量、缺口和跑团启用状态。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -827,7 +1091,7 @@ def create_mcp_servers(
                     "version": group["version"],
                     "group_mcp_url": f"{config.public_url or f'http://127.0.0.1:{config.port}'}/mcp/groups/{group['group_key']}",
                     "ready_to_enable": setup["ready_to_enable"],
-                    "sync": setup["sync"],
+                    "message_state": setup["message_state"],
                     "next_actions": setup["next_actions"],
                 }
             )
@@ -871,7 +1135,8 @@ def create_mcp_servers(
         group = store.get_group(group_key)
         runtime.manager.require_active()
         async with runtime.manager.limiter:
-            members = await client.get_group_member_list(str(group["qq_group_id"]))
+            with onebot_action_source(client, "manual_group_member_list"):
+                members = await client.get_group_member_list(str(group["qq_group_id"]))
         if query:
             lowered = query.lower()
             members = [
@@ -908,18 +1173,9 @@ def create_mcp_servers(
             str | None,
             Field(
                 description=(
-                    "可选的本群长期 RP 准则；最多 4096 字，空字符串表示清除，省略则保持不变。"
+                    "可选的本群长期 RP 准则；最多 16000 字，空字符串表示清除，省略则保持不变。"
                 ),
                 max_length=ROLEPLAY_GUIDANCE_MAX_LENGTH,
-            ),
-        ] = None,
-        history_since: Annotated[
-            str | None,
-            Field(
-                description=(
-                    "可选的本群旧消息回填起点，使用包含时区的 ISO 8601；"
-                    "空字符串表示停止深回填，省略则保持不变。"
-                )
             ),
         ] = None,
     ) -> dict[str, Any]:
@@ -930,7 +1186,6 @@ def create_mcp_servers(
                 module_title=module_title,
                 display_label=display_label,
                 roleplay_guidance=roleplay_guidance,
-                history_since=history_since,
             )
             return {"group": _group_meta(group), "version": group["version"]}
         except VersionConflictError as error:
@@ -945,8 +1200,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.set_member_roles",
         description=(
-            "调用 admin.list_group_members 并取得用户明确选择后使用。为固定群绑定恰好一名"
-            "当前玩家，以及可选的 KP 和骰娘 QQ 号列表。"
+            "调用 admin.list_group_members 并取得用户明确选择后使用。为固定群绑定同一玩家"
+            "使用的一个或多个 QQ 号，以及可选的 KP 和骰娘 QQ 号列表。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -956,8 +1211,12 @@ def create_mcp_servers(
         group_key: _GroupKey,
         expected_version: _ExpectedVersion,
         player_qq_user_id: Annotated[
-            str, Field(description="当前玩家的稳定 QQ 号，必须来自本群成员列表。")
+            str, Field(description="当前玩家的主要 QQ 号，必须来自本群成员列表。")
         ],
+        player_qq_user_ids: Annotated[
+            list[str] | None,
+            Field(description="可选的同一玩家其他 QQ 号列表；已登记账号会自动补入。"),
+        ] = None,
         kp_qq_user_ids: Annotated[
             list[str] | None, Field(description="可选的 KP QQ 号列表，必须来自本群成员列表。")
         ] = None,
@@ -968,10 +1227,30 @@ def create_mcp_servers(
         group = store.get_group(group_key)
         runtime.manager.require_active()
         async with runtime.manager.limiter:
-            members = await client.get_group_member_list(str(group["qq_group_id"]))
+            with onebot_action_source(client, "manual_member_role_setup"):
+                members = await client.get_group_member_list(str(group["qq_group_id"]))
         by_id = {str(item["qq_user_id"]): item for item in members}
-        ids = [player_qq_user_id, *(kp_qq_user_ids or []), *(dice_bot_qq_user_ids or [])]
-        missing = [item for item in ids if item not in by_id]
+        players = list(dict.fromkeys([player_qq_user_id, *(player_qq_user_ids or [])]))
+        if any(account["account_id"] == player_qq_user_id for account in store.list_qq_accounts()):
+            players = list(
+                dict.fromkeys(
+                    [
+                        *players,
+                        *[
+                            str(account["account_id"])
+                            for account in store.list_qq_accounts()
+                            if account["status"] != "disabled"
+                        ],
+                    ]
+                )
+            )
+        ids = [*players, *(kp_qq_user_ids or []), *(dice_bot_qq_user_ids or [])]
+        missing = [
+            item
+            for item in ids
+            if item not in by_id
+            and item not in {str(account["account_id"]) for account in store.list_qq_accounts()}
+        ]
         if missing:
             raise ValueError("以下 QQ 不在当前群成员列表：" + ", ".join(missing))
         try:
@@ -979,9 +1258,17 @@ def create_mcp_servers(
                 group_key,
                 expected_version=expected_version,
                 player_qq_user_id=player_qq_user_id,
+                player_qq_user_ids=players,
                 kp_qq_user_ids=kp_qq_user_ids or [],
                 dice_bot_qq_user_ids=dice_bot_qq_user_ids or [],
-                display_names={item: str(by_id[item]["display_name"]) for item in ids},
+                display_names={
+                    item: (
+                        str(by_id[item]["display_name"])
+                        if item in by_id
+                        else str(store.qq_account(item)["label"])
+                    )
+                    for item in ids
+                },
             )
             return {
                 "group": _group_meta(store.get_group(group_key)),
@@ -994,8 +1281,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.set_group_enabled",
         description=(
-            "仅在用户直接要求后启用或停用本群跑团工具。只要群仍在白名单内，"
-            "停用跑团也不会停止消息同步。"
+            "仅在用户直接要求后启用或停用本群跑团工具。停用不会停止该群的 SSE 入库，"
+            "也不会改变 AI 访问授权。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -1021,7 +1308,7 @@ def create_mcp_servers(
                 "group": _group_meta(updated),
                 "roleplay_enabled": updated["roleplay_enabled"],
                 "version": updated["version"],
-                "sync_continues": True,
+                "sse_collection_continues": True,
             }
         except VersionConflictError as error:
             return _error("VERSION_CONFLICT", str(error))
@@ -1034,7 +1321,7 @@ def create_mcp_servers(
         if not group["roleplay_enabled"]:
             return None, _error(
                 "GROUP_DISABLED",
-                "该群的跑团工具已停用；白名单消息仍在后台同步。",
+                "该群的跑团工具已停用；SSE 仍会保存群消息。",
                 next_actions=[
                     {
                         "label": "启用群 App",
@@ -1055,14 +1342,19 @@ def create_mcp_servers(
     )
     async def get_status() -> dict[str, Any]:
         group = selected_group()
-        sync = store.state(str(group["qq_group_id"]))
+        state = store.state(str(group["qq_group_id"]))
         return {
             "group": _group_meta(group),
             "roleplay_enabled": group["roleplay_enabled"],
             "version": group["version"],
             "collection_control": runtime.manager.control_status(),
             **_readiness(store, rules, group),
-            "sync_freshness": sync_freshness(sync, config.context_freshness_seconds),
+            "message_state": state,
+            "sse": store.runtime_status("sse"),
+            "message_gaps": store.list_message_gaps(
+                group_id=str(group["qq_group_id"]),
+                unresolved_only=True,
+            ),
         }
 
     @group_mcp.tool(
@@ -1133,19 +1425,14 @@ def create_mcp_servers(
                 ],
             )
         group_key = str(group["group_key"])
-        sync = store.state(str(group["qq_group_id"]))
-        freshness = sync_freshness(sync, config.context_freshness_seconds)
-        if not freshness["fresh"]:
+        sse = store.runtime_status("sse")
+        if not sse.get("connected") or sse.get("online") is False or sse.get("good") is False:
             return _error(
                 "QQ_CONTEXT_STALE",
-                "最近 QQ 消息同步已超过安全时限或最近一次同步失败，拒绝返回可能过期的跑团上下文。",
+                "NapCat SSE 当前未确认健康，拒绝返回可能缺失最新消息的跑团上下文。",
                 next_actions=[
                     {
-                        "label": "检查群同步",
-                        "instruction": "先调用 trpg.get_status 查看同步年龄和错误。",
-                    },
-                    {
-                        "label": "检查 NapCat",
+                        "label": "检查采集状态",
                         "instruction": "在管理 App 调用 admin.get_napcat_status。",
                     },
                 ],
@@ -1171,6 +1458,37 @@ def create_mcp_servers(
             has_more = len(page) > limit
             messages = page[-limit:]
             direction = "latest"
+        if messages:
+            context_start = min(int(message["sent_at"]) for message in messages)
+            context_end = max(int(message["sent_at"]) for message in messages)
+        else:
+            context_start = int(datetime.now().timestamp())
+            context_end = context_start
+        if direction in {"latest", "newer"}:
+            context_end = int(datetime.now().timestamp())
+        overlapping_gaps = store.message_gaps_overlapping(
+            group_id,
+            start_at=context_start,
+            end_at=context_end,
+        )
+        if overlapping_gaps:
+            return _error(
+                "MESSAGE_GAP_OVERLAPS_CONTEXT",
+                "本次消息范围与尚未修复的采集缺口重叠，拒绝返回不完整上下文。",
+                next_actions=[
+                    {
+                        "label": "检查消息缺口",
+                        "instruction": "在管理 App 调用 admin.list_message_gaps。",
+                    }
+                ],
+            )
+        older_gaps = store.unresolved_message_gaps_before(
+            group_id,
+            timestamp=context_start,
+        )
+        accepted_gaps = [
+            gap for gap in store.list_message_gaps(group_id=group_id) if gap["status"] == "accepted"
+        ]
         character = store.character(group_key)
         return {
             "notice": _UNTRUSTED_NOTICE,
@@ -1199,8 +1517,16 @@ def create_mcp_servers(
                     else None
                 ),
             },
-            "sync": sync,
-            "sync_freshness": freshness,
+            "collection": {
+                "sse": sse,
+                "context_range": {
+                    "start_at": context_start,
+                    "end_at": context_end,
+                },
+                "older_unresolved_gaps": older_gaps,
+                "accepted_unverified_gaps": accepted_gaps,
+                "complete_for_returned_range": True,
+            },
             "rules": rules.health(),
         }
 

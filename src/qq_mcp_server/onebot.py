@@ -4,6 +4,9 @@ import asyncio
 import json
 import time
 from collections import defaultdict
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any
 
@@ -38,6 +41,17 @@ _SESSION_ERROR_MARKERS = (
 )
 
 
+@contextmanager
+def onebot_action_source(client: object, source: str) -> Iterator[None]:
+    """为真实客户端标注审计来源；测试替身和兼容客户端安全降级。"""
+    factory = getattr(client, "action_source", None)
+    if not callable(factory):
+        yield
+        return
+    with factory(source):
+        yield
+
+
 class OneBotClient:
     """最小只读 OneBot 11 客户端；不存在发送动作或任意动作入口。"""
 
@@ -59,10 +73,15 @@ class OneBotClient:
         request_timeout: float = 20,
         history_timeout: float = 90,
         transport: httpx.AsyncBaseTransport | None = None,
+        audit_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if not token:
             raise ValueError("ONEBOT_ACCESS_TOKEN 不能为空")
         self._history_timeout = history_timeout
+        self._audit_hook = audit_hook
+        self._action_source: ContextVar[str] = ContextVar(
+            "onebot_action_source", default="unspecified"
+        )
         self._stats: dict[str, dict[str, Any]] = defaultdict(
             lambda: {
                 "calls": 0,
@@ -83,7 +102,61 @@ class OneBotClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    @contextmanager
+    def action_source(self, source: str) -> Iterator[None]:
+        text = source.strip()[:80]
+        if not text:
+            raise ValueError("OneBot 调用来源不能为空")
+        token = self._action_source.set(text)
+        try:
+            yield
+        finally:
+            self._action_source.reset(token)
+
     async def _action(
+        self, action: str, payload: dict[str, Any] | None = None, *, history: bool = False
+    ) -> Any:
+        started = time.monotonic()
+        try:
+            result = await self._execute_action(action, payload, history=history)
+        except Exception as error:
+            self._record_audit(
+                action,
+                outcome="error",
+                latency_ms=(time.monotonic() - started) * 1000,
+                error_type=type(error).__name__,
+            )
+            raise
+        self._record_audit(
+            action,
+            outcome="success",
+            latency_ms=(time.monotonic() - started) * 1000,
+            error_type=None,
+        )
+        return result
+
+    def _record_audit(
+        self,
+        action: str,
+        *,
+        outcome: str,
+        latency_ms: float,
+        error_type: str | None,
+    ) -> None:
+        if self._audit_hook is None:
+            return
+        self._audit_hook(
+            {
+                "action": action,
+                "source": self._action_source.get(),
+                "outcome": outcome,
+                "latency_ms": round(latency_ms, 3),
+                "error_type": error_type,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
+
+    async def _execute_action(
         self, action: str, payload: dict[str, Any] | None = None, *, history: bool = False
     ) -> Any:
         if action not in self._ALLOWED_ACTIONS:

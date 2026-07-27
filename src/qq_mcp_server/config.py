@@ -324,7 +324,7 @@ def load_config(path: Path) -> AppConfig:
 
 
 def default_config_text(*, account_id: str) -> str:
-    return f'''# 群白名单在管理 MCP 发起的极简网页中维护，不在这里填写群号。
+    return f'''# 群访问授权在管理 MCP 发起的极简网页中维护，不在这里填写群号。
 [qq]
 account_id = "{account_id}"
 onebot_url = "http://127.0.0.1:3000"
@@ -342,7 +342,7 @@ unreachable_backoff_max_seconds = 900
 initial_collection_paused = false
 request_timeout_seconds = 20
 history_timeout_seconds = 90
-# 兼容旧部署的全局回填下限；新配置应通过管理 MCP 为每个群单独设置。
+# 兼容旧部署；v0.6 运行服务不再自动历史回填。
 # history_since = "2026-01-01T00:00:00+08:00"
 
 [storage]

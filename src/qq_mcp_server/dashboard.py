@@ -12,7 +12,6 @@ from starlette.responses import HTMLResponse
 
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.models import ROLEPLAY_GUIDANCE_MAX_LENGTH
-from qq_mcp_server.runtime import sync_freshness
 from qq_mcp_server.store import MessageStore
 
 _SECTIONS = ("overview", "guidance", "card", "notes", "messages", "changes")
@@ -130,7 +129,11 @@ def _role_rows(roles: dict[str, Any]) -> list[dict[str, str]]:
     names = roles["display_names"]
     rows: list[dict[str, str]] = []
     groups = [
-        ("player", [roles["player_qq_user_id"]] if roles["player_qq_user_id"] else []),
+        (
+            "player",
+            roles.get("player_qq_user_ids")
+            or ([roles["player_qq_user_id"]] if roles["player_qq_user_id"] else []),
+        ),
         ("kp", roles["kp_qq_user_ids"]),
         ("dice_bot", roles["dice_bot_qq_user_ids"]),
     ]
@@ -148,7 +151,10 @@ def _role_rows(roles: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def _message_role(sender_id: str, roles: dict[str, Any]) -> str:
-    if sender_id == roles["player_qq_user_id"]:
+    players = set(roles.get("player_qq_user_ids") or [])
+    if not players and roles["player_qq_user_id"]:
+        players.add(str(roles["player_qq_user_id"]))
+    if sender_id in players:
         return "player"
     if sender_id in roles["kp_qq_user_ids"]:
         return "kp"
@@ -197,17 +203,30 @@ def _overview_context(
 ) -> dict[str, Any]:
     group_key = str(group["group_key"])
     group_id = str(group["qq_group_id"])
-    sync = store.state(group_id)
+    message_state = store.state(group_id)
+    sse = store.runtime_status("sse")
+    unresolved_gaps = store.list_message_gaps(
+        group_id=group_id,
+        unresolved_only=True,
+    )
     character = store.character(group_key)
     return {
         "roles": _role_rows(store.member_roles(group_key)),
-        "sync": {
-            **sync,
-            "last_sync_at_display": _format_time(sync["last_sync_at"], timezone),
-            "oldest_time_display": _format_time(sync["oldest_time"], timezone),
-            "newest_time_display": _format_time(sync["newest_time"], timezone),
+        "message_state": {
+            **message_state,
+            "oldest_time_display": _format_time(message_state["oldest_time"], timezone),
+            "newest_time_display": _format_time(message_state["newest_time"], timezone),
         },
-        "freshness": sync_freshness(sync, config.context_freshness_seconds),
+        "sse": {
+            **sse,
+            "healthy": bool(
+                sse.get("connected")
+                and sse.get("online") is not False
+                and sse.get("good") is not False
+            ),
+            "updated_at_display": _format_time(sse.get("updated_at"), timezone),
+        },
+        "unresolved_gaps": unresolved_gaps,
         "character_source": (
             {
                 "filename": character["source_filename"],

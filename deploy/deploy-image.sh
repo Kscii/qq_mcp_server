@@ -24,7 +24,7 @@ case "$database_container_path" in
     /data/*) database_path="$data_dir/${database_container_path#/data/}" ;;
     *) echo "DATABASE_PATH 必须位于 /data 持久卷内" >&2; exit 2 ;;
 esac
-migration_marker="$data_dir/control/pre-v3-backup.path"
+migration_marker="$data_dir/control/pre-v4-backup.path"
 printf 'APP_IMAGE=%s\n' "$1" > deploy.env
 chmod 600 deploy.env
 
@@ -46,7 +46,7 @@ if [ -n "$old_image" ]; then
             echo "迁移备份不存在，拒绝自动恢复：$backup_path" >&2
             exit 1
         fi
-        echo "新版本健康检查失败，正在恢复迁移前的 v2 数据库。" >&2
+        echo "新版本健康检查失败，正在恢复迁移前数据库。" >&2
         docker compose --env-file .env --env-file deploy.env stop app >/dev/null 2>&1 || true
         python3 -c '
 import os, sqlite3, sys

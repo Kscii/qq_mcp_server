@@ -10,12 +10,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
-from qq_mcp_server.application import build_services, run_server
+from qq_mcp_server.application import run_server
 from qq_mcp_server.config import ConfigError, default_config_text, load_config
 from qq_mcp_server.napcat import prepare_napcat_config
 from qq_mcp_server.rules import RuleIndex, RuleSource, build_rule_index
 from qq_mcp_server.store import MessageStore, backup_database
-from qq_mcp_server.sync import SyncService
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,9 +29,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="显示调试日志")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="交互创建最小部署配置")
-    commands.add_parser("sync", help="对白名单群执行最近同步并继续历史回填")
-    commands.add_parser("run", help="持续多群同步并启动 Admin/群 MCP")
-    status = commands.add_parser("status", help="查看白名单群、同步和规则索引状态")
+    commands.add_parser("run", help="启动纯 SSE 群消息采集和 Admin/群 MCP")
+    status = commands.add_parser("status", help="查看 AI 授权群、SSE 状态和规则索引")
     status.add_argument("--json", action="store_true", help="输出 JSON")
     backup = commands.add_parser("backup", help="使用 SQLite 在线备份当前数据库")
     backup.add_argument("--output-dir", type=Path, help="备份目录，默认数据库同级 backups")
@@ -63,33 +61,7 @@ def _setup(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(default_config_text(account_id=account), encoding="utf-8")
     print(f"✓ 已写入 {path}")
-    print("下一步构建规则索引、设置 ONEBOT_ACCESS_TOKEN，然后运行服务并从管理 App 加白名单。")
-
-
-async def _sync_once(path: Path) -> None:
-    config = load_config(path)
-    client, store, manager, _, _, _ = build_services(config)
-    try:
-        targets = store.sync_targets()
-        if not targets:
-            print("当前没有白名单群；请先运行服务并通过管理 App 打开白名单网页。")
-            return
-        for target in targets:
-            service = SyncService(config, target, client, store, manager.limiter)
-            state = store.state(target.group_id)
-            if not state["recent_ready"]:
-                await service.sync_recent()
-            result = (
-                await service.sync_recent()
-                if store.state(target.group_id)["initial_import_complete"]
-                else await service.import_all()
-            )
-            print(
-                f"✓ {target.group_name}（{target.group_id}）："
-                f"收到 {result.received}，新增 {result.inserted}，页 {result.pages}"
-            )
-    finally:
-        await client.close()
+    print("下一步构建规则索引、设置 ONEBOT_ACCESS_TOKEN，然后运行服务并从管理 App 授予群访问。")
 
 
 def _status(path: Path, as_json: bool) -> None:
@@ -99,10 +71,13 @@ def _status(path: Path, as_json: bool) -> None:
         "account_id": config.account_id,
         "database": str(config.database_path),
         "rules": RuleIndex(config.rules_database_path).health(),
+        "sse": store.runtime_status("sse"),
+        "message_gaps": store.list_message_gaps(unresolved_only=True),
+        "onebot_actions": store.onebot_action_summary(),
         "groups": [
             {
                 **group,
-                "sync": store.state(str(group["qq_group_id"])),
+                "message_state": store.state(str(group["qq_group_id"])),
                 "roles": store.member_roles(str(group["group_key"])),
                 "has_character": store.character(str(group["group_key"])) is not None,
             }
@@ -113,14 +88,13 @@ def _status(path: Path, as_json: bool) -> None:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     print(f"QQ 账号：{config.account_id}")
-    print(f"白名单群：{len(payload['groups'])} 个")
+    print(f"AI 授权群：{len(payload['groups'])} 个")
     print(f"规则索引：{'就绪' if payload['rules'].get('ready') else '未就绪'}")
     for group in payload["groups"]:
-        sync = group["sync"]
+        state = group["message_state"]
         print(
             f"- {group['qq_group_name']}（{group['qq_group_id']}）："
-            f"消息 {sync['message_count']}，最近 {'就绪' if sync['recent_ready'] else '未就绪'}，"
-            f"历史 {'完成' if sync['initial_import_complete'] else '回填中'}，"
+            f"消息 {state['message_count']}，"
             f"跑团 {'启用' if group['roleplay_enabled'] else '停用'}"
         )
 
@@ -150,8 +124,6 @@ def main() -> None:
     try:
         if arguments.command == "setup":
             _setup(arguments.config)
-        elif arguments.command == "sync":
-            asyncio.run(_sync_once(arguments.config))
         elif arguments.command == "run":
             asyncio.run(run_server(load_config(arguments.config)))
         elif arguments.command == "status":

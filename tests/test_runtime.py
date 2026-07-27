@@ -58,7 +58,7 @@ def group_event(message_id: str = "10", *, group_id: str = "2") -> dict[str, Any
     }
 
 
-async def test_sse_event_discovers_groups_without_storing_non_whitelist_body(
+async def test_sse_event_discovers_and_stores_every_group_without_granting_ai_access(
     config: AppConfig,
 ) -> None:
     store = MessageStore(config.database_path)
@@ -74,7 +74,8 @@ async def test_sse_event_discovers_groups_without_storing_non_whitelist_body(
     candidate = store.group_candidate("3")
     assert candidate is not None
     assert candidate["source"] == "group_message_event"
-    assert store.state("3")["message_count"] == 0
+    assert store.state("3")["message_count"] == 1
+    assert store.get_group_by_qq("3") is None
 
     store.whitelist_group("2", "测试群")
     await runtime.handle_event(group_event())
@@ -141,18 +142,11 @@ async def test_group_registry_error_never_authorizes_napcat_restart(
             "group_ids": [],
         },
     )
-    store.set_runtime_status(
-        "sync_scheduler",
-        {
-            "ok": True,
-            "last_success_at": datetime.now(UTC).isoformat(),
-            "last_error": None,
-        },
-    )
+    store.set_runtime_status("sse", {"connected": True, "online": True, "good": True})
 
     status = await runtime.get_status()
 
-    assert status["status"] == "group_registry_suspect"
+    assert status["status"] == "healthy"
     assert status["onebot_reachable"] is True
     assert all("恢复 NapCat" not in action["label"] for action in status["next_actions"])
 

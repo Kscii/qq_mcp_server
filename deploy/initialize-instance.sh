@@ -22,6 +22,7 @@ fi
 token="$(openssl rand -hex 32)"
 printf '%s\n' \
     "QQ_ACCOUNT_ID=$1" \
+    "NAPCAT_ACCOUNT_DIR=/var/lib/qq_mcp_server/napcat/accounts/$1/qq" \
     "HOST_UID=1001" \
     "HOST_GID=1002" \
     "DATA_DIR=/var/lib/qq_mcp_server" \

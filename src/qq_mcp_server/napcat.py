@@ -90,7 +90,7 @@ def _onebot_config(token: str) -> dict[str, Any]:
                     "messagePostFormat": "array",
                     "token": token,
                     "debug": False,
-                    "reportSelfMessage": False,
+                    "reportSelfMessage": True,
                 }
             ],
             "httpClients": [],

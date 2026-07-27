@@ -19,17 +19,28 @@ def test_routine_deploy_never_starts_or_updates_napcat() -> None:
     assert "docker update" not in script
 
 
-def test_first_v3_deploy_has_verified_backup_and_v2_rollback() -> None:
+def test_first_v4_deploy_has_verified_backup_and_rollback() -> None:
     deploy = deploy_text("deploy.sh")
     rollback = deploy_text("deploy-image.sh")
 
-    assert "pre-v3-backup.path" in deploy
+    assert "pre-v4-backup.path" in deploy
     assert "backup \\" in deploy
     assert "--output-dir /data/backups" in deploy
-    assert 'if [ "$migrated_schema" != "3" ]' in deploy
+    assert 'if [ "$migrated_schema" != "4" ]' in deploy
     assert "PRAGMA integrity_check" in rollback
     assert "os.replace(temporary_path, destination_path)" in rollback
     assert "SKIP_SAFETY_MIGRATION=1 ./deploy.sh" in rollback
+
+
+def test_account_switch_helper_uses_fixed_request_and_per_account_directory() -> None:
+    helper = deploy_text("switch-napcat-account.sh")
+    compose = deploy_text("compose.yaml")
+
+    assert "switch-napcat-account.request" in helper
+    assert 'account_dir="/var/lib/qq_mcp_server/napcat/accounts/$target/qq"' in helper
+    assert "QQ_ACCOUNT_ID" in helper
+    assert "NAPCAT_ACCOUNT_DIR" in helper
+    assert "${NAPCAT_ACCOUNT_DIR:-" in compose
 
 
 def test_napcat_lifecycle_requires_explicit_maintenance() -> None:

@@ -23,7 +23,7 @@ def test_old_database_is_rejected_instead_of_partially_migrated(tmp_path) -> Non
         MessageStore(path)
 
 
-def test_schema_v2_is_atomically_migrated_to_v3(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_schema_v2_is_atomically_migrated_to_v4(tmp_path) -> None:  # type: ignore[no-untyped-def]
     path = tmp_path / "v2.sqlite3"
     connection = sqlite3.connect(path)
     connection.executescript(
@@ -63,7 +63,7 @@ def test_schema_v2_is_atomically_migrated_to_v3(tmp_path) -> None:  # type: igno
     migrated = sqlite3.connect(path)
     assert migrated.execute(
         "SELECT value FROM app_metadata WHERE key = 'schema_version'"
-    ).fetchone() == ("3",)
+    ).fetchone() == ("4",)
     group_columns = {row[1] for row in migrated.execute("PRAGMA table_info(groups)")}
     sync_columns = {row[1] for row in migrated.execute("PRAGMA table_info(sync_state)")}
     assert "history_since" in group_columns
@@ -72,6 +72,16 @@ def test_schema_v2_is_atomically_migrated_to_v3(tmp_path) -> None:  # type: igno
         "reconcile_boundary_id",
         "reconcile_newest_id",
     } <= sync_columns
+    tables = {
+        row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    assert {
+        "collector_sessions",
+        "message_gaps",
+        "onebot_action_audit",
+        "qq_accounts",
+        "qq_account_switches",
+    } <= tables
     migrated.close()
 
 
@@ -242,7 +252,7 @@ def test_history_since_is_per_group_and_does_not_delete_messages(config) -> None
     assert store.state("2")["message_count"] == 1
 
 
-def test_roleplay_guidance_accepts_4096_characters_and_rejects_more(config) -> None:  # type: ignore[no-untyped-def]
+def test_roleplay_guidance_accepts_configured_limit_and_rejects_more(config) -> None:  # type: ignore[no-untyped-def]
     store = MessageStore(config.database_path)
     group = store.whitelist_group("2", "测试群")
     accepted = "界" * ROLEPLAY_GUIDANCE_MAX_LENGTH
@@ -278,3 +288,25 @@ def test_roleplay_guidance_accepts_4096_characters_and_rejects_more(config) -> N
         roleplay_guidance="  ",
     )
     assert cleared["roleplay_guidance"] == ""
+
+
+def test_registered_qq_accounts_share_player_identity_without_copying_group_data(
+    config,
+) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    group_key = str(group["group_key"])
+    store.ensure_active_qq_account("1")
+    store.set_member_roles(
+        group_key,
+        expected_version=0,
+        player_qq_user_id="1",
+        kp_qq_user_ids=[],
+        dice_bot_qq_user_ids=[],
+    )
+
+    store.register_qq_account("9", label="备用账号")
+
+    assert store.member_roles(group_key)["player_qq_user_ids"] == ["1", "9"]
+    assert len(store.list_groups()) == 1
+    assert store.active_qq_account()["account_id"] == "1"  # type: ignore[index]

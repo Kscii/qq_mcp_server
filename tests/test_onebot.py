@@ -5,7 +5,12 @@ import json
 import httpx
 import pytest
 
-from qq_mcp_server.onebot import OneBotClient, OneBotError, OneBotSessionError
+from qq_mcp_server.onebot import (
+    OneBotClient,
+    OneBotError,
+    OneBotSessionError,
+    onebot_action_source,
+)
 
 
 @pytest.mark.asyncio
@@ -120,4 +125,32 @@ async def test_explicit_login_failure_is_classified_and_counted() -> None:
     stats = client.stats()["get_login_info"]
     assert stats["calls"] == 1
     assert stats["errors"] == 1
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_onebot_action_audit_records_explicit_source_and_outcome() -> None:
+    records: list[dict[str, object]] = []
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "status": "ok",
+                    "retcode": 0,
+                    "data": {"user_id": "1"},
+                },
+            )
+        ),
+        audit_hook=records.append,
+    )
+
+    with onebot_action_source(client, "account_switch_finalize"):
+        await client.get_login_info()
+
+    assert records[0]["action"] == "get_login_info"
+    assert records[0]["source"] == "account_switch_finalize"
+    assert records[0]["outcome"] == "success"
     await client.close()

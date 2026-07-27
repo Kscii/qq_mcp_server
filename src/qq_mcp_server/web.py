@@ -29,7 +29,8 @@ line-height:1.55;color:#172033}} table{{width:100%;border-collapse:collapse}}
 th,td{{border-bottom:1px solid #d8deea;padding:.65rem;text-align:left}}
 button{{padding:.55rem .85rem;margin:.2rem;border:0;border-radius:.4rem;background:#2762d7;color:white}}
 .danger{{background:#b42318}} .card{{padding:1rem;border:1px solid #d8deea;border-radius:.6rem}}
-.muted{{color:#667085}} code{{word-break:break-all}} input[type=file]{{max-width:100%}}
+.muted{{color:#667085}} code{{word-break:break-all}} input{{max-width:100%;padding:.5rem;
+margin:.25rem 0;box-sizing:border-box}}
 </style></head><body><h1>{title}</h1>{body}</body></html>""".format(
             title=html.escape(title), body=body
         ),
@@ -64,20 +65,16 @@ def register_web_routes(
     runtime: NapCatRuntime,
 ) -> None:
     @mcp.custom_route("/admin/groups/{token}", methods=["GET", "POST"], include_in_schema=False)
-    async def group_whitelist(request: Request) -> Response:
+    async def group_access(request: Request) -> Response:
         token = str(request.path_params["token"])
         try:
-            capability = store.capability(token, kind="group_whitelist")
-            registry_warning = ""
-            try:
-                joined = await runtime.refresh_registry()
-            except Exception as error:
-                joined = []
-                registry_warning = (
-                    '<div class="card"><p><strong>当前无法刷新 QQ 群列表。</strong></p>'
-                    f"<p>{html.escape(str(error))}</p>"
-                    "<p>仍会显示由消息事件或直接验证发现的候选群。</p></div>"
-                )
+            capability = store.capability(token, kind="group_access")
+            joined: list[dict[str, object]] = []
+            registry_warning = (
+                '<div class="card"><p><strong>本页不会主动查询 QQ。</strong></p>'
+                "<p>这里显示 SSE 已经发现的群；若目标群尚未发过消息，请回到管理 MCP "
+                "明确调用 admin.refresh_group_registry。</p></div>"
+            )
             joined_by_id = {str(item["group_id"]): item for item in joined}
             if request.method == "POST":
                 form = await request.form()
@@ -97,7 +94,7 @@ def register_web_routes(
                         group_name = str(item["group_name"])
                     group = store.whitelist_group(group_id, group_name)
                     message = (
-                        f"已将 {html.escape(group_name)} 加入白名单。"
+                        f"已允许 AI 读取 {html.escape(group_name)}。"
                         f"群 App 地址：<code>{html.escape(_group_mcp_url(config, str(group['group_key'])))}</code>"
                     )
                 elif action == "remove":
@@ -105,13 +102,14 @@ def register_web_routes(
                     group = store.get_group(group_key)
                     store.remove_from_whitelist(group_key)
                     message = (
-                        f"已将 {html.escape(str(group['qq_group_name']))} 移出白名单并停止同步。"
+                        f"已撤销 AI 对 {html.escape(str(group['qq_group_name']))} 的读取权限；"
+                        "SSE 仍会继续保存新消息。"
                     )
                 else:
-                    raise ValueError("未知白名单操作")
-                store.capability(token, kind="group_whitelist", consume=True)
+                    raise ValueError("未知访问授权操作")
+                store.capability(token, kind="group_access", consume=True)
                 return _page(
-                    "白名单已更新",
+                    "AI 访问授权已更新",
                     f'<div class="card"><p>{message}</p><p>请返回 ChatGPT 继续配置。</p></div>',
                 )
 
@@ -154,25 +152,112 @@ def register_web_routes(
                     action = (
                         '<form method="post"><input type="hidden" name="action" value="remove">'
                         f'<input type="hidden" name="group_key" value="{html.escape(str(group["group_key"]))}">'
-                        '<button class="danger" type="submit">移出白名单</button></form>'
+                        '<button class="danger" type="submit">撤销 AI 访问</button></form>'
                     )
                 else:
                     action = (
                         '<form method="post"><input type="hidden" name="action" value="add">'
                         f'<input type="hidden" name="group_id" value="{html.escape(group_id)}">'
-                        '<button type="submit">加入白名单</button></form>'
+                        '<button type="submit">允许 AI 访问</button></form>'
                     )
                 rows.append(
                     f"<tr><td>{name}</td><td>{html.escape(group_id)}</td>"
                     f"<td>{html.escape(discovery)}</td><td>{action}</td></tr>"
                 )
             body = (
-                '<p class="muted">这里只维护数据采集白名单。模组、成员角色和启停继续在管理 App 中完成。</p>'
+                '<p class="muted">所有群消息都会经 SSE 保存；这里只控制 AI/MCP 是否能读取正文。</p>'
                 f"{registry_warning}"
                 "<table><thead><tr><th>群</th><th>群号</th><th>来源</th><th>操作</th></tr></thead>"
                 f"<tbody>{''.join(rows)}</tbody></table>"
             )
-            return _page("QQ群白名单", body)
+            return _page("QQ群 AI 访问授权", body)
+        except Exception as error:
+            return _error(error)
+
+    @mcp.custom_route(
+        "/admin/accounts/{token}",
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
+    async def qq_account_registration(request: Request) -> Response:
+        token = str(request.path_params["token"])
+        try:
+            store.capability(token, kind="qq_account_registration")
+            if request.method == "POST":
+                form = await request.form()
+                account_id = str(form.get("account_id") or "").strip()
+                label = str(form.get("label") or "").strip()
+                account = store.register_qq_account(account_id, label=label)
+                store.capability(token, kind="qq_account_registration", consume=True)
+                return _page(
+                    "QQ 账号已登记",
+                    '<div class="card">'
+                    f"<p>已登记 <strong>{html.escape(str(account['label']))}</strong>"
+                    f"（{html.escape(str(account['account_id']))}）。</p>"
+                    "<p>登记不会登录或切换 QQ。请返回 ChatGPT，由管理 MCP 发起切换。</p>"
+                    "</div>",
+                )
+            rows = "".join(
+                "<tr>"
+                f"<td>{html.escape(str(account['label']))}</td>"
+                f"<td>{html.escape(str(account['account_id']))}</td>"
+                f"<td>{html.escape(str(account['status']))}</td>"
+                "</tr>"
+                for account in store.list_qq_accounts()
+            )
+            return _page(
+                "登记备用 QQ 账号",
+                '<div class="card"><p>这里只登记账号标识，不收集 QQ 密码，也不会立即登录。</p>'
+                '<form method="post"><label>QQ 号<br><input name="account_id" '
+                'inputmode="numeric" pattern="[0-9]+" required></label><br>'
+                '<label>账号标签<br><input name="label" maxlength="40" required></label><br>'
+                '<button type="submit">登记账号</button></form></div>'
+                "<h2>已登记账号</h2>"
+                "<table><thead><tr><th>标签</th><th>QQ 号</th><th>状态</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>",
+            )
+        except Exception as error:
+            return _error(error)
+
+    @mcp.custom_route(
+        "/admin/account-switch/{token}",
+        methods=["GET", "POST"],
+        include_in_schema=False,
+    )
+    async def qq_account_switch(request: Request) -> Response:
+        token = str(request.path_params["token"])
+        try:
+            capability = store.capability(token, kind="qq_account_switch")
+            switch_id = str(capability["payload"].get("switch_id") or "")
+            switch = store.qq_account_switch(switch_id)
+            target = store.qq_account(str(switch["target_account_id"]))
+            if request.method == "GET":
+                return _page(
+                    "确认切换 QQ 账号",
+                    '<div class="card"><p><strong>切换会停止当前 NapCat，'
+                    "并保持消息采集暂停，直到目标账号登录验证成功。</strong></p>"
+                    f"<p>目标：{html.escape(str(target['label']))}"
+                    f"（{html.escape(str(target['account_id']))}）</p>"
+                    "<p>不会自动切回旧账号，也不会自动反复登录。</p>"
+                    '<form method="post"><button class="danger" type="submit">'
+                    "确认切换</button></form></div>",
+                )
+            runtime.request_account_switch(switch_id)
+            store.capability(token, kind="qq_account_switch", consume=True)
+            webui_token = store.issue_capability(
+                kind="napcat_webui",
+                group_key=None,
+                issued_to=str(capability["issued_to"]),
+                ttl_seconds=config.upload_token_ttl_seconds,
+            )
+            return _page(
+                "QQ 账号切换已提交",
+                '<div class="card"><p>宿主机正在切换到目标账号的固定登录目录。</p>'
+                "<p>若页面随后断开属于应用重启的正常现象。等待约 20 秒后打开私有面板登录，"
+                "再回到 ChatGPT 完成账号验证。</p>"
+                f'<p><a href="{html.escape(napcat_webui_url(config, webui_token))}">'
+                "打开 NapCat 私有面板</a></p></div>",
+            )
         except Exception as error:
             return _error(error)
 
@@ -226,7 +311,7 @@ def register_web_routes(
                 return _page(
                     "确认恢复 NapCat",
                     '<div class="card"><p><strong>此操作会重启 NapCat。</strong></p>'
-                    "<p>消息同步会短暂中断；QQ 可能要求重新扫码登录。"
+                    "<p>SSE 消息采集会短暂中断；QQ 可能要求重新扫码登录。"
                     "每次至少间隔 1 小时，24 小时最多执行 2 次。</p>"
                     '<form method="post"><button class="danger" type="submit">'
                     "确认重启 NapCat</button></form></div>",
@@ -387,6 +472,14 @@ def _group_mcp_url(config: AppConfig, group_key: str) -> str:
 
 def admin_page_url(config: AppConfig, token: str) -> str:
     return f"{_base_url(config)}/admin/groups/{token}"
+
+
+def qq_account_registration_url(config: AppConfig, token: str) -> str:
+    return f"{_base_url(config)}/admin/accounts/{token}"
+
+
+def qq_account_switch_url(config: AppConfig, token: str) -> str:
+    return f"{_base_url(config)}/admin/account-switch/{token}"
 
 
 def card_upload_url(config: AppConfig, token: str) -> str:

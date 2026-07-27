@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch for confirmed qq_mcp_server account switch requests
+
+[Path]
+PathExists=/var/lib/qq_mcp_server/control/switch-napcat-account.request
+Unit=qq-mcp-account-switch.service
+
+[Install]
+WantedBy=multi-user.target
+

@@ -14,6 +14,7 @@ from qq_mcp_server.onebot import (
     OneBotClient,
     OneBotConfigurationError,
     OneBotSessionError,
+    onebot_action_source,
 )
 from qq_mcp_server.store import MessageStore
 
@@ -331,6 +332,17 @@ class MultiGroupSyncManager:
         self._active.clear()
         return self._set_control("paused_manual", reason=text[:500], source="admin_mcp")
 
+    def pause_for(self, reason: str, *, source: str) -> dict[str, Any]:
+        text = reason.strip()
+        if not text:
+            raise ValueError("暂停原因不能为空")
+        self._active.clear()
+        return self._set_control(
+            "paused_manual",
+            reason=text[:500],
+            source=source[:80] or "internal",
+        )
+
     def pause_session(self, error: Exception, *, source: str) -> dict[str, Any]:
         self._active.clear()
         return self._set_control(
@@ -349,7 +361,8 @@ class MultiGroupSyncManager:
 
     async def verify_account(self) -> dict[str, Any]:
         async with self.limiter:
-            login = await self.client.get_login_info()
+            with onebot_action_source(self.client, "manual_collection_resume"):
+                login = await self.client.get_login_info()
         actual = str(login.get("user_id") or "")
         if actual != self.config.account_id:
             raise AccountMismatchError(
@@ -366,9 +379,13 @@ class MultiGroupSyncManager:
         except OneBotConfigurationError as error:
             self.pause_configuration(error, source="admin_resume_check")
             raise
-        control = self._set_control("active", reason=None, source="admin_resume_check")
-        self._active.set()
+        control = self.activate_verified(source="admin_resume_check")
         return {"control": control, "login": login}
+
+    def activate_verified(self, *, source: str) -> dict[str, Any]:
+        control = self._set_control("active", reason=None, source=source)
+        self._active.set()
+        return control
 
     async def run_cycle(self) -> dict[str, Any]:
         self.require_active()

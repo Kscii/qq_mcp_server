@@ -21,6 +21,7 @@ sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" \
     /var/lib/qq_mcp_server/control \
     /var/lib/qq_mcp_server/napcat/config \
     /var/lib/qq_mcp_server/napcat/qq \
+    /var/lib/qq_mcp_server/napcat/accounts \
     /var/lib/qq_mcp_server/caddy/data \
     /var/lib/qq_mcp_server/caddy/config
 

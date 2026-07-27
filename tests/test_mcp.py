@@ -112,8 +112,18 @@ async def test_admin_and_group_apps_are_separate(config: AppConfig) -> None:
     admin_tools = {tool.name for tool in await admin.list_tools()}
     group_tools = {tool.name for tool in await group_mcp.list_tools()}
     assert admin_tools == {
-        "admin.open_group_whitelist",
+        "admin.open_group_access",
         "admin.get_napcat_status",
+        "admin.list_message_gaps",
+        "admin.create_message_gap",
+        "admin.control_message_gap_repair",
+        "admin.accept_message_gap",
+        "admin.list_qq_accounts",
+        "admin.open_qq_account_registration",
+        "admin.begin_qq_account_switch",
+        "admin.get_qq_account_switch_status",
+        "admin.complete_qq_account_switch",
+        "admin.cancel_qq_account_switch",
         "admin.pause_qq_collection",
         "admin.resume_qq_collection",
         "admin.refresh_group_registry",
@@ -157,7 +167,7 @@ async def test_all_tool_and_parameter_descriptions_are_chinese(config: AppConfig
     )
 
     tools = [*(await admin.list_tools()), *(await group_mcp.list_tools())]
-    assert len(tools) == 24
+    assert len(tools) == 34
     for tool in tools:
         assert tool.description
         assert any("\u4e00" <= character <= "\u9fff" for character in tool.description)
@@ -228,6 +238,7 @@ async def test_group_context_is_fixed_and_marks_untrusted_messages(config: AppCo
         error=None,
     )
     store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
+    store.set_runtime_status("sse", {"connected": True, "online": True, "good": True})
     _, group_mcp = create_mcp_servers(
         config,
         store,
@@ -258,6 +269,7 @@ async def test_group_context_pages_backward_without_raising_single_call_limit(
         error=None,
     )
     store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
+    store.set_runtime_status("sse", {"connected": True, "online": True, "good": True})
     _, group_mcp = create_mcp_servers(
         config,
         store,
@@ -305,3 +317,33 @@ async def test_group_context_refuses_unsynchronized_messages(config: AppConfig) 
     async with Client(group_mcp) as client:
         result = await client.call_tool("trpg.get_roleplay_context", {})
     assert result.data["error"]["code"] == "QQ_CONTEXT_STALE"
+
+
+async def test_group_context_refuses_range_overlapping_unresolved_gap(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.upsert([message("1", "缺口前消息"), message("3", "缺口后消息")])
+    store.create_message_gap(
+        "2",
+        start_at=1,
+        end_at=3,
+        confidence="confirmed",
+        source="sse_disconnect",
+    )
+    store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
+    store.set_runtime_status("sse", {"connected": True, "online": True, "good": True})
+    _, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    async with Client(group_mcp) as client:
+        result = await client.call_tool("trpg.get_roleplay_context", {})
+
+    assert result.data["error"]["code"] == "MESSAGE_GAP_OVERLAPS_CONTEXT"

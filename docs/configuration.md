@@ -1,30 +1,30 @@
 # 配置与操作
 
-## 配置应该放在哪里
+## 配置归属
 
-| 内容 | 唯一入口 | 原因 |
-|---|---|---|
-| QQ 账号、OneBot 私有地址、数据库/卡片/规则路径、OAuth、公网地址、同步参数 | TOML/环境变量，部署时很少改 | 服务基础设施和秘密不能交给群聊决定 |
-| QQ 群加入/移出采集白名单 | 管理 MCP 签发的一次性网页 | 这是唯一需要人工确认群列表的配置 UI |
-| QQ 登录与 NapCat 恢复 | 管理 MCP 签发的一次性确认页 | 长期 Token 不进入 AI；重启还需要人工确认 |
-| 模组名、显示名、本群长期 RP 准则 | `admin.update_group_profile` | AI 可先读版本并可靠地结构化更新；准则最多 4096 字 |
-| 玩家、KP、骰娘 QQ 号 | `admin.list_group_members` 后调用 `admin.set_member_roles` | 绑定稳定 QQ 号，不绑定易变昵称 |
-| 跑团启用/停用 | `admin.set_group_enabled` | 只允许白名单群；停用不停止消息同步 |
-| 当前 Excel 人物卡 | 群 MCP 签发的一次性上传/预览/确认页 | MCP 发起且绑定当前群，Web 只承担文件选择器 |
-| HP/SAN/MP、技能、物品等动态值 | `trpg.commit_turn_updates` | 原子更新、来源消息、版本和撤销均可审计 |
-| 重要线索、人物、地点、目标等团务笔记 | 用户确认后 `trpg.commit_turn_updates` | 避免 AI 把模糊叙事写成事实 |
-| 查看当前群已保存的完整模组资料 | `trpg.open_campaign_dashboard` 签发的一小时只读页 | 固定绑定当前群，不增加 Web 编辑入口 |
-| 三本规则书 | 部署者执行 `build-rules` | PDF 私有、固定且不应出现在运行期 WebUI |
+| 内容 | 入口 |
+|---|---|
+| 当前 QQ、OneBot 地址、存储路径、OAuth、公网地址 | TOML、环境变量和部署脚本 |
+| 登记备用 QQ | `admin.open_qq_account_registration` 的一次性网页 |
+| 切换 QQ | `admin.begin_qq_account_switch` 的确认页，登录后由 MCP 完成验证 |
+| 允许/禁止 AI 读取群 | `admin.open_group_access` 的一次性网页 |
+| 模组名、显示名、长期 RP 准则（最多 16000 字） | `admin.update_group_profile` |
+| 玩家 QQ 别名、KP、骰娘 | `admin.list_group_members` 后 `admin.set_member_roles` |
+| 跑团启用/停用 | `admin.set_group_enabled` |
+| 当前 Excel 人物卡 | `trpg.begin_character_card_upload` 的上传、预览和确认页 |
+| 人物卡动态值与团务笔记 | `trpg.commit_turn_updates` |
+| 查看单群全部已保存资料 | `trpg.open_campaign_dashboard` 的一小时只读页 |
+| 消息缺口 | 管理 MCP 列出、登记、人工启动修复或接受 |
+| 三本规则书 | 部署者执行 `build-rules` |
 
-WebUI 没有通用设置页或人物卡编辑器。它只呈现白名单按钮、一次性的文件上传确认，以及
-群 MCP 签发的只读模组档案。正常跑团和全部资料修改仍在 MCP 对话中完成。
+WebUI 刻意没有通用设置页。它只承担群访问授权、账号登记/切换确认、文件选择、
+NapCat 私有跳转和只读模组面板；资料修改尽量留在带结构化参数和版本检查的 MCP。
 
 ## 命令
 
 ```bash
 qq_mcp_server setup
 qq_mcp_server build-rules --investigator INVESTIGATOR.pdf --keeper KEEPER.pdf --magic MAGIC.pdf
-qq_mcp_server sync
 qq_mcp_server run
 qq_mcp_server status [--json]
 qq_mcp_server backup
@@ -32,127 +32,134 @@ qq_mcp_server pause-collection --reason "维护"
 qq_mcp_server prepare-napcat DIRECTORY
 ```
 
-`setup` 只创建基础 TOML。`build-rules` 原子重建私有规则索引。`sync` 对当前所有白名单
-群执行一次最近同步和已配置日期的历史回填；持续运行时不必另开 `sync`。`status`、
-`backup` 和 `pause-collection` 都不连接 QQ，适合健康检查、升级备份和安全维护。
-`prepare-napcat` 生成仅监听回环、只开 HTTP API 的 NapCat 配置。
+`status`、`backup` 和 `pause-collection` 不连接 QQ。v0.6 不再提供主动 `sync` 命令；
+正常采集只消费 SSE，历史只通过消息缺口流程人工启动。
 
 ## TOML 与环境变量
 
-示例见 [`config.example.toml`](../config.example.toml)。群号、群名和模组不属于静态配置。
+示例见 [`config.example.toml`](../config.example.toml)。群号、模组、账号登记和切换状态
+都不属于静态 TOML。
 
-`[qq]`：
+`[qq]` 的有效运行参数：
 
-- `account_id`：NapCat 登录 QQ；可用 `QQ_ACCOUNT_ID` 覆盖。
-- `onebot_url`：允许回环 HTTP，或仅 Tailnet 可达的 `.ts.net` HTTPS；可用 `ONEBOT_URL` 覆盖。
-- `onebot_sse_url`：同上且路径必须为 `/_events`；默认 `127.0.0.1:3001`。
-- `poll_interval_seconds`：全局最近消息对账周期，默认 60 秒。
-- `registry_refresh_seconds`：白名单任务刷新周期，1–60 秒。
-- `group_discovery_interval_seconds`：主动强制刷新群列表的周期，默认 900 秒。
-- `context_freshness_seconds`：跑团上下文允许的最大成功对账年龄，默认 180 秒。
-- `sync_concurrency`：兼容旧配置；运行期固定使用全局单并发。
-- `page_size`：历史分页大小，1–500。
-- `backfill_min_delay_seconds` / `backfill_max_delay_seconds`：旧历史页间随机等待，默认 2–5 秒。
-- `backfill_pages_per_cycle`：每轮全局最多回填页数，默认 3。
-- `unreachable_backoff_max_seconds`：网络不可达退避上限，默认 900 秒。
-- `initial_collection_paused` / `INITIAL_COLLECTION_PAUSED`：首次创建安全状态时是否暂停。
+- `account_id` / `QQ_ACCOUNT_ID`：当前唯一运行的 NapCat QQ。
+- `onebot_url` / `ONEBOT_URL`：回环 HTTP 或 Tailnet `.ts.net` HTTPS。
+- `onebot_sse_url` / `ONEBOT_SSE_URL`：同上，路径必须为 `/_events`。
+- `page_size`：人工缺口修复的历史分页大小。
+- `initial_collection_paused` / `INITIAL_COLLECTION_PAUSED`：首次创建控制状态时是否暂停。
 - `request_timeout_seconds` / `history_timeout_seconds`：普通/历史接口超时。
-- `history_since`：仅兼容旧部署的全局下限；新部署通过 `admin.update_group_profile`
-  为每群设置，未设置时只保留最近一页并等待新消息。
+
+`poll_interval_seconds`、`registry_refresh_seconds`、`group_discovery_interval_seconds`、
+`context_freshness_seconds`、`sync_concurrency`、`backfill_*`、`unreachable_backoff_max_seconds`
+和 `history_since` 仍可读取旧配置，但 v0.6 的常驻服务不再运行周期历史/群列表调度器。
 
 `[storage]`：
 
-- `database` / `DATABASE_PATH`：全新 v0.2 数据库。
-- `cards` / `CARD_STORAGE_DIR`：当前人物卡与上传暂存目录。
-- `rules` / `RULES_DATABASE_PATH`：离线构建的三书索引。
-- `timezone`：MCP 展示消息时间使用的 IANA 时区。
-- `oauth` / `OAUTH_STORAGE_DIR`：Google OAuth 持久化状态的根目录；服务按不兼容的
-  加密格式在其中使用版本化子目录，无法解密的缓存按未命中处理，升级或密钥轮换时
-  不会因旧密文阻断授权。
+- `database` / `DATABASE_PATH`：共享 SQLite；切号不会更换。
+- `cards` / `CARD_STORAGE_DIR`：共享人物卡和上传暂存目录。
+- `rules` / `RULES_DATABASE_PATH`：共享三书索引。
+- `timezone`：消息显示使用的 IANA 时区。
+- `oauth` / `OAUTH_STORAGE_DIR`：OAuth 持久化状态。
 
 `[server]`：
 
-- `host`、`port` / `PORT`：监听地址和端口。
-- `public_url` / `PUBLIC_URL`：公网 HTTPS 根地址；设置后强制启用 OAuth 和邮箱白名单。
-- `upload_token_ttl_seconds`：一次性网页链接时效，60–3600 秒，默认 600。
-- `napcat_webui_url` / `NAPCAT_WEBUI_URL`：严格限制为
-  `https://<设备>.ts.net:8443/webui` 的 Tailscale 私有地址。
-- `napcat_webui_config` / `NAPCAT_WEBUI_CONFIG_PATH`：只在跳转确认时读取当前
-  `webui.json` Token。
-- `napcat_control_dir` / `NAPCAT_CONTROL_DIR`：应用与主机恢复助手之间的固定请求目录。
+- `host`、`port` / `PORT`：应用监听地址和端口。
+- `public_url` / `PUBLIC_URL`：公网 HTTPS 根地址；设置后要求 OAuth 与邮箱授权。
+- `upload_token_ttl_seconds`：一次性网页链接时效。
+- `napcat_webui_url` / `NAPCAT_WEBUI_URL`：Tailscale 私有
+  `https://<设备>.ts.net:8443/webui`。
+- `napcat_webui_config` / `NAPCAT_WEBUI_CONFIG_PATH`：跳转确认时读取当前 WebUI Token。
+- `napcat_control_dir` / `NAPCAT_CONTROL_DIR`：应用与固定宿主机助手的请求目录。
 
-`[access].allowed_google_emails` 可用单个 `ALLOWED_GOOGLE_EMAIL` 覆盖。公网模式还必须设置
+生产 Compose 还使用 `NAPCAT_ACCOUNT_DIR`。每次账号切换助手将其固定到
+`/var/lib/qq_mcp_server/napcat/accounts/<QQ>/qq`，不要手工让两个 NapCat 同时运行。
+
+`[access].allowed_google_emails` 可由 `ALLOWED_GOOGLE_EMAIL` 覆盖。公网模式还需要
 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`、`MCP_JWT_SIGNING_KEY` 和
 `MCP_STORAGE_ENCRYPTION_KEY`。
 
-本项目 v0.4 的 schema v2 会在首次 v0.5 启动前备份并原子升级到 v3，保留白名单、人物卡
-和消息。旧版 qq_mcp_server 或 Dice Echo 数据仍不迁移，也不要把它们的 SQLite 改名后
-继续使用。
+schema v2/v3 会在首次 v0.6 部署前备份并原子升级到 schema v4，保留群、人物卡、笔记
+和消息。Dice Echo 或其他旧 SQLite 不迁移。
 
-## 第一次配置一个群
+## 首次配置群
 
-1. 在 ChatGPT 连接管理 App `/mcp/admin`。
-2. 说“打开群白名单”，AI 调用 `admin.open_group_whitelist`；打开短期网页加入群。
-3. 调用 `admin.list_groups`，选定它返回的 `group_key` 与固定群 App URL。
-4. 设置永久模组名；调用成员列表并绑定一个玩家，以及可选的 KP/骰娘。
-5. 在 ChatGPT 新建/选择只属于这个团的对话，连接该群 URL。
-6. 说“上传人物卡”，通过返回链接选择固定模板 XLSX，检查预览并确认。
-7. 回到管理 App 启用群。规则、模组、玩家、卡片准备好之前，启用会返回缺项而不部分成功。
+1. 连接管理 App `/mcp/admin`。
+2. 让群内产生一条新消息，或明确调用 `admin.refresh_group_registry`。
+3. 调用 `admin.open_group_access`，在短期网页允许 AI 读取目标群。
+4. 用 `admin.list_groups` 获取固定 `group_key` 与群 MCP URL。
+5. 设置模组、长期 RP 准则，读取成员并绑定玩家/KP/骰娘。
+6. 在只属于该团的 ChatGPT 对话连接群 MCP URL。
+7. 上传固定模板人物卡并确认。
+8. 回到管理 App 启用群。
 
-白名单是“允许采集”；启用是“允许跑团工具”。白名单内停用群仍同步。移出白名单才会
-停止同步并撤销群端点。一个群不切换模组，新团建立新群。
+所有群消息都会经 SSE 入库；访问授权只控制 AI 是否能读，启停只控制跑团工具。
+
+## QQ 账号登记与切换
+
+1. `admin.open_qq_account_registration`：打开网页登记 QQ 号和标签，不输入密码。
+2. 确保目标 QQ 已加入全部当前启用的跑团群。
+3. `admin.begin_qq_account_switch(target_account_id)`：打开浏览器确认页。
+4. 确认后旧 NapCat 停止，服务切到目标账号专属目录并保持采集暂停。
+5. `admin.open_napcat_webui`：在 Tailscale 私有面板登录目标 QQ。
+6. 登录成功后调用 `admin.complete_qq_account_switch(switch_id)`。
+
+最后一步只执行一次登录信息和一次强制群列表读取。账号或群不匹配时保持目标账号和暂停
+状态，不自动切回、不自动重试。失败后同一目标冷却 30 分钟，24 小时最多三次失败。
+
+所有登记账号被视为同一玩家的 QQ 别名，共享群数据。一个时刻仍只有一个采集账号。
 
 ## 管理 MCP 工具
 
-- `admin.open_group_whitelist()`：签发一次性白名单页。
-- `admin.get_napcat_status()`：诊断登录、OneBot、SSE、群注册表和逐群同步新鲜度。
-- `admin.pause_qq_collection(reason)`：持久化暂停全部 QQ 读取。
-- `admin.resume_qq_collection()`：用户重新登录后单次校验账号并恢复。
-- `admin.refresh_group_registry()`：带 60 秒冷却的强制 `no_cache` 群列表刷新。
-- `admin.probe_group(group_id)`：列表缺失时直接验证当前 QQ 是否能访问指定群。
-- `admin.open_napcat_webui()`：签发不向 AI 暴露长期 Token 的私有面板入口。
-- `admin.open_napcat_recovery()`：取得用户明确同意后签发重启二次确认页。
-- `admin.list_groups()`：群、固定 URL、版本、同步和下一步。
-- `admin.get_group_setup(group_key)`：单群完整准备清单。
-- `admin.list_group_members(group_key, query?, limit)`：读取稳定 QQ 号。
-- `admin.update_group_profile(group_key, expected_version, ...)`：模组、标签、每群回填起点和
-  最多 4096 字的长期 RP 准则。
-- `admin.set_member_roles(group_key, expected_version, player, kp?, dice_bot?)`：成员角色。
-- `admin.set_group_enabled(group_key, expected_version, enabled)`：群级启停。
+群访问与诊断：
 
-管理写工具只应响应 ChatGPT 用户直接要求，不能因为 QQ 群正文触发。所有写工具使用
-`expected_version`；冲突后先重新读，不自动覆盖。
+- `admin.open_group_access`
+- `admin.get_napcat_status`
+- `admin.pause_qq_collection` / `admin.resume_qq_collection`
+- `admin.refresh_group_registry` / `admin.probe_group`
+- `admin.open_napcat_webui` / `admin.open_napcat_recovery`
+
+消息缺口：
+
+- `admin.list_message_gaps`
+- `admin.create_message_gap`
+- `admin.control_message_gap_repair`
+- `admin.accept_message_gap`
+
+QQ 账号：
+
+- `admin.list_qq_accounts`
+- `admin.open_qq_account_registration`
+- `admin.begin_qq_account_switch`
+- `admin.get_qq_account_switch_status`
+- `admin.complete_qq_account_switch`
+- `admin.cancel_qq_account_switch`
+
+模组：
+
+- `admin.list_groups` / `admin.get_group_setup`
+- `admin.list_group_members`
+- `admin.update_group_profile`
+- `admin.set_member_roles`
+- `admin.set_group_enabled`
 
 ## 群 MCP 工具
 
-- `trpg.get_status()`：即使停用也可用的准备与诊断。
-- `trpg.open_campaign_dashboard()`：签发绑定当前群、一小时有效且可重复浏览的只读档案页。
-- `trpg.get_roleplay_context(since_message_id?, before_message_id?, limit)`：正常拟定回复的
-  单次聚合读取；两个游标互斥，默认 30、最多 100 条，并返回下一页游标。
-- `trpg.get_character_card(view="roleplay"|"full")`：当前卡和可选单元格来源。
-- `trpg.search_messages(query?, sender_qq_user_id?, after?, before?, limit)`：旧消息条件搜索。
-- `trpg.search_coc_rules(query, book="all"|"investigator"|"keeper"|"magic", limit)`：规则检索。
-- `trpg.begin_character_card_upload()`：签发绑定本群的 XLSX 上传确认页。
-- `trpg.commit_turn_updates(expected_version, origin, summary, card_operations?, note_operations?)`：原子更新。
-- `trpg.list_changes(limit, before_change_id?)`：审计 AI 写入。
-- `trpg.undo_change(change_id, expected_version, reason)`：定向撤销整次写入。
+- `trpg.get_status`
+- `trpg.open_campaign_dashboard`
+- `trpg.get_roleplay_context`
+- `trpg.get_character_card`
+- `trpg.search_messages`
+- `trpg.search_coc_rules`
+- `trpg.begin_character_card_upload`
+- `trpg.commit_turn_updates`
+- `trpg.list_changes`
+- `trpg.undo_change`
 
-所有群工具的群作用域来自 URL，刻意不接受群名、群号或 `group_key`。人物卡操作采用 JSON
-Pointer 的 `set`、`increment`、`add`、`remove`；笔记类别是 `clue`、`npc`、`location`、
-`objective`、`event`、`other`。自动机械更新必须附本群
-真实消息 ID；重要线索先征得用户同意。
+群工具的群作用域来自 URL。`get_roleplay_context` 在 SSE 未确认健康、采集暂停或返回范围
+与未解决缺口重叠时拒绝提供可能误导的上下文。
 
-## AI 行为，不使用关键词路由
+## AI 路由
 
-Admin 和群 MCP 已带内置 instructions。模型应从用户自然语言和工具描述自行选择接口，
-不需要输入 `/命令`，也不需要附加 Skill/index：
-
-- 正常拟定跑团回复：一次 `trpg.get_roleplay_context`，默认给三个动态命名且明显不同的候选。
-- 精确规则确实影响回答/检定建议时：再用 `trpg.search_coc_rules`。
-- 明确 HP/SAN/MP、技能、物品等结果：可以自动提交并回报 `change_id`。
-- 多条重要未记录线索：先列标题询问，用户同意后提交笔记。
-- 用户说“撤销刚才更新”：先读变更，按明确 `change_id` 整批撤销。
-
-符号约定是语义提示，不是服务器解析命令：`#` 是当前人物动作，双引号是人物对白，圆括号
-是玩家场外发言；只有绑定玩家 QQ 的圆括号才代表当前人物玩家。无符号文本由 AI 结合角色
-和上下文判断，低置信推断不得持久化。
+Admin 与群 MCP 已内置中文 instructions、工具说明、参数说明、读写注解和下一步，不需要
+关键词命令或额外 Skill。Skill 可能方便固定个人工作流，但不会降低服务器响应时间，也
+不应绕过浏览器确认、版本检查和账号/缺口安全限制。

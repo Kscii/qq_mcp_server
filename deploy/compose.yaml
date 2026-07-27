@@ -13,7 +13,7 @@ services:
       NAPCAT_GID: ${HOST_GID:-1002}
     volumes:
       - ${DATA_DIR:-/var/lib/qq_mcp_server}/napcat/config:/app/napcat/config
-      - ${DATA_DIR:-/var/lib/qq_mcp_server}/napcat/qq:/app/.config/QQ
+      - ${NAPCAT_ACCOUNT_DIR:-/var/lib/qq_mcp_server/napcat/qq}:/app/.config/QQ
     logging:
       driver: local
       options:

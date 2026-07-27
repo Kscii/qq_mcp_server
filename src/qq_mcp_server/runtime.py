@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from qq_mcp_server.onebot import (
     OneBotClient,
     OneBotConfigurationError,
     OneBotSessionError,
+    onebot_action_source,
 )
 from qq_mcp_server.store import MessageStore
 from qq_mcp_server.sync import (
@@ -82,6 +84,20 @@ class NapCatRuntime:
         self.manager = manager or MultiGroupSyncManager(config, client, store)
         self._sse_transport = sse_transport
         self._registry_lock = asyncio.Lock()
+        self._session_id: str | None = None
+        self.store.ensure_active_qq_account(config.account_id)
+        abandoned = self.store.close_abandoned_collector_session()
+        if abandoned is not None:
+            heartbeat_at = abandoned.get("last_heartbeat_at") or abandoned.get("connected_at")
+            try:
+                start_at = int(datetime.fromisoformat(str(heartbeat_at)).timestamp())
+            except (TypeError, ValueError):
+                start_at = int(_utc_now().timestamp())
+            self.store.create_message_gaps_for_all(
+                start_at=start_at,
+                confidence="suspected",
+                source="unclean_restart",
+            )
 
     async def refresh_registry(self, *, force: bool = False) -> list[dict[str, Any]]:
         self.manager.require_active()
@@ -101,14 +117,15 @@ class NapCatRuntime:
             attempt_at = _iso_now()
             try:
                 async with self.manager.limiter:
-                    login = await self.client.get_login_info()
-                    actual = str(login.get("user_id") or "")
-                    if actual != self.config.account_id:
-                        raise AccountMismatchError(
-                            f"NapCat 当前登录 QQ {actual or '未知'}，"
-                            f"配置要求 {self.config.account_id}"
-                        )
-                    groups = await self.client.get_group_list()
+                    with onebot_action_source(self.client, "manual_group_registry_refresh"):
+                        login = await self.client.get_login_info()
+                        actual = str(login.get("user_id") or "")
+                        if actual != self.config.account_id:
+                            raise AccountMismatchError(
+                                f"NapCat 当前登录 QQ {actual or '未知'}，"
+                                f"配置要求 {self.config.account_id}"
+                            )
+                        groups = await self.client.get_group_list()
                 for group in groups:
                     self.store.upsert_group_candidate(
                         str(group["group_id"]),
@@ -153,6 +170,19 @@ class NapCatRuntime:
         if not group_id.isdigit():
             raise ValueError("group_id 只能包含数字")
         self.manager.require_active()
+        observed = self.store.group_candidate(group_id)
+        if (
+            observed
+            and observed["available"]
+            and observed["source"] in {"group_message_event", "group_increase_event"}
+        ):
+            return {
+                "status": "verified",
+                "group_id": group_id,
+                "group_name": observed["group_name"],
+                "verification_method": "sse_event",
+                "verified_until": None,
+            }
         registry_error: Exception | None = None
         groups: list[dict[str, Any]] = []
         try:
@@ -188,13 +218,15 @@ class NapCatRuntime:
 
         try:
             async with self.manager.limiter:
-                info = await self.client.get_group_info(group_id, no_cache=True)
+                with onebot_action_source(self.client, "manual_group_probe"):
+                    info = await self.client.get_group_info(group_id, no_cache=True)
             group_name = str(info.get("group_name") or group_id)
             verification_method: str | None = None
             member_error: Exception | None = None
             try:
                 async with self.manager.limiter:
-                    members = await self.client.get_group_member_list(group_id, no_cache=True)
+                    with onebot_action_source(self.client, "manual_group_probe"):
+                        members = await self.client.get_group_member_list(group_id, no_cache=True)
                 if any(
                     str(member.get("qq_user_id") or "") == self.config.account_id
                     for member in members
@@ -218,13 +250,9 @@ class NapCatRuntime:
                 member_error = error
 
             if verification_method is None:
-                try:
-                    async with self.manager.limiter:
-                        await self.client.get_group_history(group_id, 1)
-                    verification_method = "readable_history"
-                except Exception as history_error:
-                    selected_error = member_error or history_error
-                    raise selected_error from history_error
+                if member_error is not None:
+                    raise member_error
+                raise ValueError("无法通过群列表、SSE 事件或成员列表验证当前账号在群内")
 
             candidate = self.store.upsert_group_candidate(
                 group_id,
@@ -269,57 +297,37 @@ class NapCatRuntime:
     async def get_status(self) -> dict[str, Any]:
         registry = self.store.runtime_status("group_registry")
         sse = self.store.runtime_status("sse")
-        scheduler = self.store.runtime_status("sync_scheduler")
         control = self.manager.control_status()
-        registry_ids = {str(item) for item in registry.get("group_ids", [])}
-        sync_groups: list[dict[str, Any]] = []
-        sync_degraded = False
-        registry_suspect = False
+        unresolved_gaps = self.store.list_message_gaps(unresolved_only=True)
+        group_status: list[dict[str, Any]] = []
         for group in self.store.list_groups():
             state = self.store.state(str(group["qq_group_id"]))
-            freshness = sync_freshness(state, self.config.context_freshness_seconds)
-            sync_degraded = sync_degraded or not freshness["fresh"]
-            missing_from_registry = (
-                bool(registry.get("ok")) and str(group["qq_group_id"]) not in registry_ids
-            )
-            registry_suspect = registry_suspect or missing_from_registry
-            sync_groups.append(
+            gaps = [
+                gap for gap in unresolved_gaps if str(gap["group_id"]) == str(group["qq_group_id"])
+            ]
+            group_status.append(
                 {
                     "group_key": group["group_key"],
                     "group_id": group["qq_group_id"],
                     "group_name": group["qq_group_name"],
-                    "freshness": freshness,
-                    "missing_from_group_list": missing_from_registry,
+                    "ai_access_enabled": bool(group["whitelisted"]),
+                    "message_count": state["message_count"],
+                    "newest_message_at": state["newest_time"],
+                    "unresolved_gap_count": len(gaps),
                 }
             )
-        registry_suspect = registry_suspect or any(
-            (
-                candidate["source"] in {"group_message_event", "group_increase_event"}
-                or (candidate["source"] == "direct_probe" and candidate["verification_valid"])
-            )
-            and candidate["group_id"] not in registry_ids
-            and candidate["available"]
-            for candidate in self.store.list_group_candidates()
-        )
-
-        registry_error = str(registry.get("last_error") or "")
-        scheduler_error = str(scheduler.get("last_error") or "")
         if control.get("status") == "paused_session":
             status = "login_required"
         elif control.get("status") == "paused_manual":
             status = "collection_paused"
         elif control.get("status") == "paused_configuration":
             status = "configuration_error"
-        elif scheduler_error:
-            status = (
-                "login_required"
-                if any(word in scheduler_error for word in ("未登录", "登录 QQ", "登录状态"))
-                else "onebot_unreachable"
-            )
-        elif sync_degraded:
-            status = "sync_degraded"
-        elif registry_error or registry_suspect:
-            status = "group_registry_suspect"
+        elif not sse.get("connected"):
+            status = "onebot_unreachable" if sse.get("last_error") else "sse_connecting"
+        elif sse.get("online") is False or sse.get("good") is False:
+            status = "login_required"
+        elif unresolved_gaps:
+            status = "data_gap_warning"
         else:
             status = "healthy"
         next_actions: list[dict[str, str]] = []
@@ -349,31 +357,42 @@ class NapCatRuntime:
                     ),
                 }
             )
-        if status == "group_registry_suspect":
+        if unresolved_gaps:
             next_actions.append(
                 {
-                    "label": "刷新或直接验证群",
-                    "instruction": (
-                        "先调用 admin.refresh_group_registry；若已知群号仍缺失，"
-                        "调用 admin.probe_group。不要重启 NapCat。"
-                    ),
+                    "label": "检查消息缺口",
+                    "instruction": "调用 admin.list_message_gaps；只在用户确认后启动区间修复。",
                 }
             )
         return {
             "status": status,
             "expected_account_id": self.config.account_id,
-            "current_account_id": registry.get("account_id"),
-            "onebot_reachable": not bool(scheduler_error),
+            "current_account_id": (self.store.active_qq_account() or {}).get("account_id"),
+            "onebot_reachable": bool(sse.get("connected")),
             "collection_control": control,
-            "sync_scheduler": scheduler,
-            "group_registry": {
-                **registry,
-                "suspect": registry_suspect,
-            },
+            "group_registry": registry,
             "sse": sse,
-            "groups": sync_groups,
+            "collector_session": self.store.active_collector_session(),
+            "accounts": self.store.list_qq_accounts(),
+            "latest_account_switch": self.store.latest_qq_account_switch(),
+            "onebot_action_audit": self.store.onebot_action_summary(),
+            "unresolved_message_gaps": unresolved_gaps,
+            "groups": group_status,
             "next_actions": next_actions,
         }
+
+    def _open_outage(self, *, source: str, confidence: str, start_at: int | None = None) -> None:
+        self.store.create_message_gaps_for_all(
+            start_at=start_at or int(_utc_now().timestamp()),
+            confidence=confidence,
+            source=source,
+        )
+
+    def _mark_stream_healthy(self, *, event_at: int | None = None) -> None:
+        self.store.close_open_message_gaps(
+            end_at=event_at or int(_utc_now().timestamp()),
+            automatic_only=True,
+        )
 
     async def handle_event(self, event: dict[str, Any]) -> None:
         if not self.manager.is_active():
@@ -388,21 +407,67 @@ class NapCatRuntime:
             )
             return
         post_type = str(event.get("post_type") or "")
+        event_at = int(event.get("time") or int(_utc_now().timestamp()))
+        if post_type == "meta_event":
+            meta_type = str(event.get("meta_event_type") or "")
+            if meta_type == "heartbeat":
+                status = event.get("status")
+                status = status if isinstance(status, dict) else {}
+                online = status.get("online")
+                good = status.get("good")
+                interval = event.get("interval")
+                interval_ms = int(interval) if isinstance(interval, (int, float)) else None
+                if self._session_id is not None:
+                    with suppress(KeyError):
+                        self.store.update_collector_heartbeat(
+                            self._session_id,
+                            interval_ms=interval_ms,
+                            online=online if isinstance(online, bool) else None,
+                            good=good if isinstance(good, bool) else None,
+                        )
+                current = self.store.runtime_status("sse")
+                self.store.set_runtime_status(
+                    "sse",
+                    {
+                        **{key: value for key, value in current.items() if key != "updated_at"},
+                        "connected": True,
+                        "last_event_at": _iso_now(),
+                        "last_heartbeat_at": _iso_now(),
+                        "heartbeat_interval_ms": interval_ms,
+                        "online": online if isinstance(online, bool) else None,
+                        "good": good if isinstance(good, bool) else None,
+                        "last_error": None,
+                    },
+                )
+                if online is False or good is False:
+                    self._open_outage(
+                        source="heartbeat_degraded",
+                        confidence="confirmed",
+                        start_at=event_at,
+                    )
+                else:
+                    self._mark_stream_healthy(event_at=event_at)
+            elif meta_type == "lifecycle":
+                self._mark_stream_healthy(event_at=event_at)
+            return
         group_id = str(event.get("group_id") or "")
         if not group_id.isdigit():
             return
         group_name = str(event.get("group_name") or group_id)
-        if post_type == "message" and str(event.get("message_type") or "") == "group":
+        if (
+            post_type in {"message", "message_sent"}
+            and str(event.get("message_type") or "") == "group"
+        ):
             existing = self.store.get_group_by_qq(group_id)
             self.store.upsert_group_candidate(
                 group_id,
                 str(existing["qq_group_name"]) if existing else group_name,
                 source="group_message_event",
             )
-            if existing and existing["whitelisted"]:
-                message = normalize_message(event, expected_group_id=group_id)
-                if message is not None:
-                    self.store.upsert([message])
+            message = normalize_message(event, expected_group_id=group_id)
+            if message is not None:
+                self.store.upsert([message])
+            self._mark_stream_healthy(event_at=event_at)
             return
         if post_type != "notice":
             return
@@ -416,6 +481,20 @@ class NapCatRuntime:
             )
         elif notice_type == "group_decrease" and user_id == self.config.account_id:
             self.store.mark_group_candidate_unavailable(group_id, source="group_decrease_event")
+
+    def _begin_sse_session(self) -> None:
+        session = self.store.start_collector_session(self.config.account_id)
+        self._session_id = str(session["session_id"])
+
+    def _end_sse_session(
+        self, *, reason: str, open_gap: bool, confidence: str = "confirmed"
+    ) -> None:
+        if self._session_id is not None:
+            with suppress(KeyError):
+                self.store.end_collector_session(self._session_id, reason=reason)
+            self._session_id = None
+        if open_gap:
+            self._open_outage(source="sse_disconnect", confidence=confidence)
 
     async def run_sse_forever(self) -> None:
         delay = 1.0
@@ -436,14 +515,18 @@ class NapCatRuntime:
                             )
                             raise CollectionPausedError("SSE 配置熔断")
                         response.raise_for_status()
+                        self._begin_sse_session()
+                        previous = self.store.runtime_status("sse")
                         self.store.set_runtime_status(
                             "sse",
                             {
                                 "connected": True,
                                 "connected_at": _iso_now(),
-                                "last_event_at": self.store.runtime_status("sse").get(
-                                    "last_event_at"
-                                ),
+                                "last_event_at": previous.get("last_event_at"),
+                                "last_heartbeat_at": previous.get("last_heartbeat_at"),
+                                "heartbeat_interval_ms": previous.get("heartbeat_interval_ms"),
+                                "online": previous.get("online"),
+                                "good": previous.get("good"),
                                 "last_error": None,
                             },
                         )
@@ -463,13 +546,16 @@ class NapCatRuntime:
                                 event = json.loads(raw)
                                 if isinstance(event, dict):
                                     await self.handle_event(event)
+                                    current = self.store.runtime_status("sse")
                                     self.store.set_runtime_status(
                                         "sse",
                                         {
+                                            **{
+                                                key: value
+                                                for key, value in current.items()
+                                                if key != "updated_at"
+                                            },
                                             "connected": True,
-                                            "connected_at": self.store.runtime_status("sse").get(
-                                                "connected_at"
-                                            ),
                                             "last_event_at": _iso_now(),
                                             "last_error": None,
                                         },
@@ -478,25 +564,43 @@ class NapCatRuntime:
                                 LOGGER.warning("忽略无效 OneBot SSE 事件：%s", error)
                     raise RuntimeError("SSE 连接已结束")
                 except asyncio.CancelledError:
+                    self._end_sse_session(
+                        reason="application_shutdown",
+                        open_gap=True,
+                        confidence="suspected",
+                    )
                     raise
                 except CollectionPausedError:
+                    self._end_sse_session(
+                        reason="collection_paused",
+                        open_gap=True,
+                        confidence="confirmed",
+                    )
+                    previous = self.store.runtime_status("sse")
                     self.store.set_runtime_status(
                         "sse",
                         {
+                            **{
+                                key: value for key, value in previous.items() if key != "updated_at"
+                            },
                             "connected": False,
-                            "connected_at": self.store.runtime_status("sse").get("connected_at"),
-                            "last_event_at": self.store.runtime_status("sse").get("last_event_at"),
                             "last_error": "collection_paused",
                         },
                     )
                     continue
                 except Exception as error:
+                    self._end_sse_session(
+                        reason=f"{type(error).__name__}: {error}"[:500],
+                        open_gap=True,
+                    )
+                    previous = self.store.runtime_status("sse")
                     self.store.set_runtime_status(
                         "sse",
                         {
+                            **{
+                                key: value for key, value in previous.items() if key != "updated_at"
+                            },
                             "connected": False,
-                            "connected_at": self.store.runtime_status("sse").get("connected_at"),
-                            "last_event_at": self.store.runtime_status("sse").get("last_event_at"),
                             "last_error": f"{type(error).__name__}: {error}"[:500],
                         },
                     )
@@ -505,6 +609,7 @@ class NapCatRuntime:
                     delay = min(delay * 2, 30)
 
     async def run_discovery_forever(self) -> None:
+        """兼容旧调用；新应用启动链不会运行周期群发现。"""
         while True:
             await self.manager.wait_until_active()
             try:
@@ -514,6 +619,152 @@ class NapCatRuntime:
             except Exception as error:
                 LOGGER.warning("主动刷新群列表失败：%s", error)
             await asyncio.sleep(self.config.group_discovery_interval_seconds)
+
+    async def run_watchdog_forever(self) -> None:
+        while True:
+            now = _utc_now()
+            sse = self.store.runtime_status("sse")
+            heartbeat_at = sse.get("last_heartbeat_at")
+            heartbeat_age: float | None = None
+            if isinstance(heartbeat_at, str):
+                try:
+                    heartbeat_age = max(
+                        0.0, (now - datetime.fromisoformat(heartbeat_at)).total_seconds()
+                    )
+                except ValueError:
+                    heartbeat_age = None
+            interval_ms = int(sse.get("heartbeat_interval_ms") or 30_000)
+            threshold = max(60.0, interval_ms * 3 / 1000)
+            stale = bool(
+                self.manager.is_active()
+                and sse.get("connected")
+                and (heartbeat_age is None or heartbeat_age > threshold)
+            )
+            if stale:
+                self._open_outage(
+                    source="heartbeat_timeout",
+                    confidence="suspected",
+                    start_at=int((now - timedelta(seconds=threshold)).timestamp()),
+                )
+            self.store.set_runtime_status(
+                "collector_watchdog",
+                {
+                    "checked_at": now.isoformat(),
+                    "heartbeat_age_seconds": (
+                        round(heartbeat_age, 3) if heartbeat_age is not None else None
+                    ),
+                    "heartbeat_timeout_seconds": threshold,
+                    "heartbeat_stale": stale,
+                },
+            )
+            await asyncio.sleep(10)
+
+    def pause_collection(self, reason: str, *, source: str = "admin_mcp") -> dict[str, Any]:
+        self._open_outage(
+            source="collection_pause" if source == "admin_mcp" else source,
+            confidence="confirmed",
+        )
+        if source == "admin_mcp":
+            return self.manager.pause_manual(reason)
+        return self.manager.pause_for(reason, source=source)
+
+    async def resume_collection(self) -> dict[str, Any]:
+        return await self.manager.resume()
+
+    def request_account_switch(self, switch_id: str) -> Path:
+        switch = self.store.qq_account_switch(switch_id)
+        if switch["status"] != "requested":
+            raise ValueError("账号切换不是待确认状态")
+        self.pause_collection(
+            f"准备切换到 QQ {switch['target_account_id']}",
+            source="account_switch",
+        )
+        directory = self.config.napcat_control_dir
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        request = directory / "switch-napcat-account.request"
+        if request.exists():
+            raise RuntimeError("已有宿主机账号切换请求正在处理中")
+        temporary = directory / ".switch-napcat-account.request.tmp"
+        temporary.write_text(
+            json.dumps(
+                {
+                    "switch_id": switch_id,
+                    "from_account_id": switch["from_account_id"],
+                    "target_account_id": switch["target_account_id"],
+                    "requested_at": _iso_now(),
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        temporary.chmod(0o600)
+        temporary.replace(request)
+        self.store.update_qq_account_switch(switch_id, status="host_pending")
+        return request
+
+    def account_switch_status(self, switch_id: str) -> dict[str, Any]:
+        switch = self.store.qq_account_switch(switch_id)
+        path = self.config.napcat_control_dir / "switch-napcat-account.status.json"
+        try:
+            host = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            host = {"status": "not_started"}
+        except (OSError, json.JSONDecodeError) as error:
+            host = {"status": "unreadable", "error": str(error)}
+        if (
+            switch["status"] == "host_pending"
+            and isinstance(host, dict)
+            and host.get("switch_id") == switch_id
+            and host.get("status") == "awaiting_login"
+        ):
+            switch = self.store.update_qq_account_switch(switch_id, status="awaiting_login")
+        return {"switch": switch, "host": host}
+
+    async def complete_account_switch(self, switch_id: str) -> dict[str, Any]:
+        state = self.account_switch_status(switch_id)
+        switch = state["switch"]
+        if switch["status"] not in {"host_pending", "awaiting_login"}:
+            raise ValueError("账号切换当前不能完成验证")
+        target = str(switch["target_account_id"])
+        if self.config.account_id != target:
+            raise RuntimeError("应用尚未由宿主机切换到目标账号配置")
+        async with self.manager.limiter:
+            with onebot_action_source(self.client, "account_switch_finalize"):
+                login = await self.client.get_login_info()
+                actual = str(login.get("user_id") or "")
+                if actual != target:
+                    if actual:
+                        self.store.update_qq_account_switch(
+                            switch_id,
+                            status="failed",
+                            error=f"NapCat 登录的是 QQ {actual}，目标是 {target}",
+                        )
+                    raise AccountMismatchError(
+                        f"NapCat 当前登录 QQ {actual or '未知'}，目标是 {target}"
+                    )
+                groups = await self.client.get_group_list()
+        joined = {str(group["group_id"]) for group in groups}
+        required = {
+            str(group["qq_group_id"])
+            for group in self.store.list_groups()
+            if group["roleplay_enabled"]
+        }
+        missing = sorted(required - joined)
+        if missing:
+            self.store.update_qq_account_switch(
+                switch_id,
+                status="failed",
+                error=f"目标账号缺少启用跑团群：{', '.join(missing)}",
+            )
+            raise ValueError("目标账号未加入全部启用跑团群：" + "、".join(missing))
+        completed = self.store.update_qq_account_switch(switch_id, status="completed")
+        control = self.manager.activate_verified(source="account_switch_finalize")
+        return {
+            "switch": completed,
+            "collection_control": control,
+            "verified_group_count": len(groups),
+        }
 
     def request_restart(self) -> Path:
         directory = self.config.napcat_control_dir
