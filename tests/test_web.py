@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from test_cards import make_card
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.mcp_server import create_http_app, create_mcp_servers
+from qq_mcp_server.models import ChatMessage, NoteOperation
 from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.store import MessageStore
 
@@ -49,6 +51,22 @@ def services(config: AppConfig) -> tuple[MessageStore, FakeOneBot, CharacterCard
         cards,
     )
     return store, onebot, cards, create_http_app(admin, group, store)
+
+
+def dashboard_message(message_id: str, text: str, *, group_id: str = "2") -> ChatMessage:
+    return ChatMessage(
+        group_id=group_id,
+        message_id=message_id,
+        message_seq=message_id,
+        sent_at=int(message_id),
+        sender_id="10",
+        sender_nickname="玩家",
+        sender_card="山本美咲",
+        sender_display="山本美咲",
+        plain_text=text,
+        reply_to_message_id=None,
+        contains_unsupported_media=False,
+    )
 
 
 async def test_whitelist_web_page_and_group_route_guard(config: AppConfig) -> None:
@@ -110,6 +128,196 @@ async def test_character_upload_preview_and_confirm(
     character = store.character(str(group["group_key"]))
     assert character is not None
     assert character["current"]["identity"]["name"] == "调查员"
+
+
+async def test_campaign_dashboard_renders_all_read_only_sections_and_escapes_html(
+    config: AppConfig, tmp_path: Path
+) -> None:
+    store, _, cards, app = services(config)
+    group = store.whitelist_group("2", "测试群<script>alert(1)</script>")
+    group_key = str(group["group_key"])
+    guidance = "只输出“正文”\n<img src=x onerror=alert(1)>"
+    group = store.update_group_profile(
+        group_key,
+        expected_version=0,
+        module_title="神籽",
+        display_label="山本美咲",
+        roleplay_guidance=guidance,
+    )
+    store.set_member_roles(
+        group_key,
+        expected_version=int(group["version"]),
+        player_qq_user_id="10",
+        kp_qq_user_ids=[],
+        dice_bot_qq_user_ids=[],
+        display_names={"10": "美咲玩家"},
+    )
+    parsed = cards.parser.parse(make_card(tmp_path / "山本美咲.xlsx", name="山本美咲"))
+    current = copy.deepcopy(parsed.document)
+    current["vitals"]["hp"]["current"] = 8
+    store.replace_character(
+        group_key,
+        source_filename=parsed.source_filename,
+        source_sha256=parsed.source_sha256,
+        source_path="/private/never-show-this.xlsx",
+        base_card=parsed.document,
+        current_card=current,
+        clear_runtime_data=True,
+    )
+    store.upsert(
+        [
+            dashboard_message(
+                str(index),
+                "<script>alert(2)</script>" if index == 55 else f"群消息-{index}",
+            )
+            for index in range(1, 56)
+        ]
+    )
+    version = int(store.get_group(group_key)["version"])
+    store.commit_turn_updates(
+        group_key,
+        expected_version=version,
+        origin="user_request",
+        card_operations=[],
+        note_operations=[
+            NoteOperation(
+                op="create",
+                category="clue",
+                title="井边的纸条",
+                content="<b>羽祈留下的线索</b>",
+            )
+        ],
+        summary="记录井边线索",
+    )
+    token = store.issue_capability(
+        kind="campaign_dashboard",
+        group_key=group_key,
+        issued_to="local",
+        ttl_seconds=3600,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        overview = await client.get(f"/dashboard/{token}")
+        guidance_page = await client.get(f"/dashboard/{token}?section=guidance")
+        card_page = await client.get(f"/dashboard/{token}?section=card")
+        notes_page = await client.get(f"/dashboard/{token}?section=notes")
+        messages_page = await client.get(f"/dashboard/{token}?section=messages")
+        older_messages_page = await client.get(
+            f"/dashboard/{token}?section=messages&before_message_id=6"
+        )
+        filtered_page = await client.get(
+            f"/dashboard/{token}?section=messages&query=%E7%BE%A4%E6%B6%88%E6%81%AF-3"
+        )
+        changes_page = await client.get(f"/dashboard/{token}?section=changes")
+
+    assert overview.status_code == 200
+    assert "跑团已停用" in overview.text
+    assert "测试群&lt;script&gt;alert(1)&lt;/script&gt;" in overview.text
+    assert "<script>alert(1)</script>" not in overview.text
+    assert guidance in guidance_page.text.replace("&lt;", "<").replace("&gt;", ">")
+    assert "&lt;img src=x onerror=alert(1)&gt;" in guidance_page.text
+    assert f"{len(guidance)} / 4096 字" in guidance_page.text
+    assert "vitals/hp/current" in card_page.text
+    assert "8" in card_page.text
+    assert "/private/never-show-this.xlsx" not in card_page.text
+    assert "井边的纸条" in notes_page.text
+    assert "&lt;b&gt;羽祈留下的线索&lt;/b&gt;" in notes_page.text
+    assert "群消息-6" in messages_page.text
+    assert 'class="message-text">群消息-1</div>' not in messages_page.text
+    assert "查看更早消息" in messages_page.text
+    assert "&lt;script&gt;alert(2)&lt;/script&gt;" in messages_page.text
+    assert "<script>alert(2)</script>" not in messages_page.text
+    assert 'class="message-text">群消息-1</div>' in older_messages_page.text
+    assert 'class="message-text">群消息-55</div>' not in older_messages_page.text
+    assert "群消息-3" in filtered_page.text
+    assert "记录井边线索" in changes_page.text
+    assert changes_page.headers["cache-control"] == "no-store"
+    assert "frame-ancestors 'none'" in changes_page.headers["content-security-policy"]
+
+
+async def test_campaign_dashboard_capability_expiry_isolation_and_revocation(
+    config: AppConfig,
+) -> None:
+    store, _, _, app = services(config)
+    group = store.whitelist_group("2", "当前群")
+    other = store.whitelist_group("3", "绝不能出现的其他群")
+    store.upsert([dashboard_message("1", "当前群消息")])
+    store.upsert([dashboard_message("2", "其他群秘密", group_id="3")])
+    token = store.issue_capability(
+        kind="campaign_dashboard",
+        group_key=str(group["group_key"]),
+        issued_to="local",
+        ttl_seconds=3600,
+    )
+    expired = store.issue_capability(
+        kind="campaign_dashboard",
+        group_key=str(group["group_key"]),
+        issued_to="local",
+        ttl_seconds=-1,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        first = await client.get(f"/dashboard/{token}?section=messages")
+        reused = await client.get(f"/dashboard/{token}?section=overview")
+        expired_page = await client.get(f"/dashboard/{expired}")
+        invalid_section = await client.get(f"/dashboard/{token}?section=secrets")
+        store.remove_from_whitelist(str(group["group_key"]))
+        revoked = await client.get(f"/dashboard/{token}")
+
+    assert first.status_code == reused.status_code == 200
+    assert "当前群消息" in first.text
+    assert "其他群秘密" not in first.text
+    assert str(other["group_key"]) not in first.text
+    assert expired_page.status_code == 400
+    assert "链接已经过期" in expired_page.text
+    assert invalid_section.status_code == 400
+    assert revoked.status_code == 400
+
+
+async def test_campaign_dashboard_change_history_uses_cursor_pagination(
+    config: AppConfig,
+) -> None:
+    store, _, _, app = services(config)
+    group = store.whitelist_group("2", "分页测试群")
+    group_key = str(group["group_key"])
+    results: list[dict[str, Any]] = []
+    for index in range(21):
+        current = store.get_group(group_key)
+        results.append(
+            store.commit_turn_updates(
+                group_key,
+                expected_version=int(current["version"]),
+                origin="user_request",
+                card_operations=[],
+                note_operations=[
+                    NoteOperation(
+                        op="create",
+                        category="event",
+                        title=f"事件-{index}",
+                        content=f"用于验证变更分页-{index}",
+                    )
+                ],
+                summary=f"变更-{index}",
+            )
+        )
+    token = store.issue_capability(
+        kind="campaign_dashboard",
+        group_key=group_key,
+        issued_to="local",
+        ttl_seconds=3600,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        newest = await client.get(f"/dashboard/{token}?section=changes")
+        older = await client.get(
+            f"/dashboard/{token}?section=changes&before_change_id={results[1]['change_id']}"
+        )
+
+    assert "变更-20" in newest.text
+    assert "变更-0" not in newest.text
+    assert "查看更早变更" in newest.text
+    assert "变更-0" in older.text
+    assert "变更-20" not in older.text
 
 
 async def test_event_candidate_can_be_directly_verified_before_whitelist(

@@ -4,7 +4,12 @@ import sqlite3
 
 import pytest
 
-from qq_mcp_server.models import CardOperation, ChatMessage, NoteOperation
+from qq_mcp_server.models import (
+    ROLEPLAY_GUIDANCE_MAX_LENGTH,
+    CardOperation,
+    ChatMessage,
+    NoteOperation,
+)
 from qq_mcp_server.store import MessageStore, VersionConflictError
 
 
@@ -144,3 +149,41 @@ def test_version_conflict_prevents_overwrite(config) -> None:  # type: ignore[no
         assert error.current_version == 1
     else:
         raise AssertionError("expected VersionConflictError")
+
+
+def test_roleplay_guidance_accepts_4096_characters_and_rejects_more(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    accepted = "界" * ROLEPLAY_GUIDANCE_MAX_LENGTH
+    updated = store.update_group_profile(
+        str(group["group_key"]),
+        expected_version=0,
+        module_title=None,
+        display_label=None,
+        roleplay_guidance=f"\n{accepted}\n",
+    )
+    assert updated["roleplay_guidance"] == accepted
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            f"当前为 {ROLEPLAY_GUIDANCE_MAX_LENGTH + 1} 字，"
+            f"不能超过 {ROLEPLAY_GUIDANCE_MAX_LENGTH} 字"
+        ),
+    ):
+        store.update_group_profile(
+            str(group["group_key"]),
+            expected_version=1,
+            module_title=None,
+            display_label=None,
+            roleplay_guidance="界" * (ROLEPLAY_GUIDANCE_MAX_LENGTH + 1),
+        )
+
+    cleared = store.update_group_profile(
+        str(group["group_key"]),
+        expected_version=1,
+        module_title=None,
+        display_label=None,
+        roleplay_guidance="  ",
+    )
+    assert cleared["roleplay_guidance"] == ""
