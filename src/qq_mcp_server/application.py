@@ -37,7 +37,7 @@ def build_services(
         history_timeout=config.history_timeout_seconds,
     )
     manager = MultiGroupSyncManager(config, client, store)
-    runtime = NapCatRuntime(config, client, store, token)
+    runtime = NapCatRuntime(config, client, store, token, manager)
     rules = RuleIndex(config.rules_database_path)
     cards = CharacterCardService(store, config.card_storage_dir)
     return client, store, manager, rules, cards, runtime

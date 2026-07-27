@@ -38,6 +38,7 @@ class GroupTarget:
     group_key: str
     group_id: str
     group_name: str
+    history_since: str | None = None
 
 
 class CardOperation(BaseModel):

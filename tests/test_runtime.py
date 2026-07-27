@@ -102,6 +102,61 @@ async def test_direct_probe_verifies_membership_when_registry_is_stale(
     assert candidate["verification_valid"] is True
 
 
+async def test_sse_account_mismatch_persistently_pauses_collection(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    runtime = NapCatRuntime(
+        config,
+        RuntimeClient(),  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+    event = group_event()
+    event["self_id"] = "999"
+
+    await runtime.handle_event(event)
+
+    assert runtime.manager.is_active() is False
+    control = store.runtime_status("collection_control")
+    assert control["status"] == "paused_session"
+    assert control["source"] == "sse_event"
+
+
+async def test_group_registry_error_never_authorizes_napcat_restart(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    runtime = NapCatRuntime(
+        config,
+        RuntimeClient(),  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+    store.set_runtime_status(
+        "group_registry",
+        {
+            "ok": False,
+            "last_error": "OneBotError: 群列表缓存异常",
+            "group_ids": [],
+        },
+    )
+    store.set_runtime_status(
+        "sync_scheduler",
+        {
+            "ok": True,
+            "last_success_at": datetime.now(UTC).isoformat(),
+            "last_error": None,
+        },
+    )
+
+    status = await runtime.get_status()
+
+    assert status["status"] == "group_registry_suspect"
+    assert status["onebot_reachable"] is True
+    assert all("恢复 NapCat" not in action["label"] for action in status["next_actions"])
+
+
 def test_sync_error_does_not_make_stale_state_look_fresh(config: AppConfig) -> None:
     store = MessageStore(config.database_path)
     store.update_state(

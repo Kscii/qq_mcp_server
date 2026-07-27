@@ -5,7 +5,7 @@ import json
 import httpx
 import pytest
 
-from qq_mcp_server.onebot import OneBotClient, OneBotError
+from qq_mcp_server.onebot import OneBotClient, OneBotError, OneBotSessionError
 
 
 @pytest.mark.asyncio
@@ -94,4 +94,30 @@ async def test_group_registry_actions_are_normalized_and_read_only() -> None:
             "onebot_role": "member",
         }
     ]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_login_failure_is_classified_and_counted() -> None:
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "status": "failed",
+                    "retcode": 1404,
+                    "message": "当前未登录，登录状态已失效",
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(OneBotSessionError, match="未登录"):
+        await client.get_login_info()
+
+    stats = client.stats()["get_login_info"]
+    assert stats["calls"] == 1
+    assert stats["errors"] == 1
     await client.close()

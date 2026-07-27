@@ -421,6 +421,7 @@ def _group_meta(group: dict[str, Any]) -> dict[str, Any]:
         "qq_group_name": group["qq_group_name"],
         "module_title": group["module_title"] or None,
         "display_label": group["display_label"] or None,
+        "history_since": group.get("history_since") or None,
     }
 
 
@@ -628,8 +629,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.get_napcat_status",
         description=(
-            "诊断 QQ 登录、OneBot、SSE、强制群列表和各白名单群消息新鲜度。"
-            "登录或群列表异常时先调用，不返回任何 Token。"
+            "从本地缓存诊断 QQ 采集熔断、OneBot 调用统计、SSE、强制群列表和各白名单群"
+            "消息新鲜度。不会为了诊断额外请求 QQ，也不返回任何 Token。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -637,6 +638,69 @@ def create_mcp_servers(
     )
     async def get_napcat_status() -> dict[str, Any]:
         return await runtime.get_status()
+
+    @admin.tool(
+        name="admin.pause_qq_collection",
+        description=(
+            "仅在用户直接要求暂停 QQ 采集或准备维护时调用。暂停后不再请求群列表、群资料或"
+            "群历史，且应用重启后仍保持暂停；这不会退出或停止 NapCat。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def pause_qq_collection(
+        reason: Annotated[str, Field(description="用户给出的暂停原因，最多 500 字。")],
+    ) -> dict[str, Any]:
+        return {"collection_control": runtime.manager.pause_manual(reason)}
+
+    @admin.tool(
+        name="admin.resume_qq_collection",
+        description=(
+            "仅在用户明确表示已完成 QQ 登录并要求恢复采集后调用。只执行一次登录账号校验；"
+            "必须与配置账号一致才解除持久化暂停。"
+        ),
+        annotations=_WRITE,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def resume_qq_collection() -> dict[str, Any]:
+        try:
+            return await runtime.manager.resume()
+        except Exception as error:
+            return _error(
+                "QQ_COLLECTION_RESUME_FAILED",
+                str(error),
+                next_actions=[
+                    {
+                        "label": "检查登录",
+                        "instruction": "调用 admin.open_napcat_webui 并确认目标 QQ 已登录。",
+                    }
+                ],
+            )
+
+    @admin.tool(
+        name="admin.refresh_group_registry",
+        description=(
+            "仅在用户需要立即查看新加入群或怀疑群列表缓存陈旧时调用。强制执行一次"
+            "no_cache 群列表读取并更新候选群；至少 60 秒冷却，不会重启 NapCat。"
+        ),
+        annotations=_READ_ONLY,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def refresh_group_registry() -> dict[str, Any]:
+        groups = await runtime.refresh_registry(force=True)
+        return {
+            "group_count": len(groups),
+            "groups": groups,
+            "next_actions": [
+                {
+                    "label": "维护白名单",
+                    "instruction": "需要加入或移出白名单时调用 admin.open_group_whitelist。",
+                }
+            ],
+        }
 
     @admin.tool(
         name="admin.probe_group",
@@ -703,6 +767,32 @@ def create_mcp_servers(
         run_in_thread=False,
     )
     async def open_napcat_recovery() -> dict[str, Any]:
+        status = await runtime.get_status()
+        control_status = str(status["collection_control"].get("status") or "")
+        if control_status in {"paused_session", "paused_configuration"}:
+            return _error(
+                "NAPCAT_RESTART_BLOCKED",
+                "当前是登录/配置熔断，重启可能制造重复登录；请先打开面板处理登录。",
+            )
+        if status["status"] != "onebot_unreachable":
+            return _error(
+                "NAPCAT_RESTART_NOT_NEEDED",
+                "NapCat 未处于持续不可达状态；群列表缺失、同步陈旧或人工暂停不能作为重启理由。",
+            )
+        scheduler_updated = status["sync_scheduler"].get("updated_at")
+        if isinstance(scheduler_updated, str):
+            try:
+                error_age = (
+                    datetime.now().astimezone()
+                    - datetime.fromisoformat(scheduler_updated).astimezone()
+                ).total_seconds()
+            except ValueError:
+                error_age = 0
+            if error_age < 300:
+                return _error(
+                    "NAPCAT_RESTART_TOO_EARLY",
+                    "NapCat 不可达尚未持续五分钟，当前只执行网络退避，不进行重启。",
+                )
         token = store.issue_capability(
             kind="napcat_recovery",
             group_key=None,
@@ -779,7 +869,9 @@ def create_mcp_servers(
         if not 1 <= limit <= 200:
             raise ValueError("limit 必须在 1 到 200 之间")
         group = store.get_group(group_key)
-        members = await client.get_group_member_list(str(group["qq_group_id"]))
+        runtime.manager.require_active()
+        async with runtime.manager.limiter:
+            members = await client.get_group_member_list(str(group["qq_group_id"]))
         if query:
             lowered = query.lower()
             members = [
@@ -821,6 +913,15 @@ def create_mcp_servers(
                 max_length=ROLEPLAY_GUIDANCE_MAX_LENGTH,
             ),
         ] = None,
+        history_since: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "可选的本群旧消息回填起点，使用包含时区的 ISO 8601；"
+                    "空字符串表示停止深回填，省略则保持不变。"
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
         try:
             group = store.update_group_profile(
@@ -829,6 +930,7 @@ def create_mcp_servers(
                 module_title=module_title,
                 display_label=display_label,
                 roleplay_guidance=roleplay_guidance,
+                history_since=history_since,
             )
             return {"group": _group_meta(group), "version": group["version"]}
         except VersionConflictError as error:
@@ -864,7 +966,9 @@ def create_mcp_servers(
         ] = None,
     ) -> dict[str, Any]:
         group = store.get_group(group_key)
-        members = await client.get_group_member_list(str(group["qq_group_id"]))
+        runtime.manager.require_active()
+        async with runtime.manager.limiter:
+            members = await client.get_group_member_list(str(group["qq_group_id"]))
         by_id = {str(item["qq_user_id"]): item for item in members}
         ids = [player_qq_user_id, *(kp_qq_user_ids or []), *(dice_bot_qq_user_ids or [])]
         missing = [item for item in ids if item not in by_id]
@@ -956,6 +1060,7 @@ def create_mcp_servers(
             "group": _group_meta(group),
             "roleplay_enabled": group["roleplay_enabled"],
             "version": group["version"],
+            "collection_control": runtime.manager.control_status(),
             **_readiness(store, rules, group),
             "sync_freshness": sync_freshness(sync, config.context_freshness_seconds),
         }
@@ -989,8 +1094,8 @@ def create_mcp_servers(
     @group_mcp.tool(
         name="trpg.get_roleplay_context",
         description=(
-            "每次开始处理跑团回复时调用一次。返回本固定群的近期消息、发送者身份、"
-            "当前人物、有效笔记、近期变更和同步状态。"
+            "每次开始处理跑团回复时调用一次。默认返回本固定群最近消息、发送者身份、"
+            "当前人物、有效笔记、近期变更和同步状态；只有场景上下文不足时才使用游标分页。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -998,7 +1103,12 @@ def create_mcp_servers(
     )
     async def get_roleplay_context(
         since_message_id: Annotated[
-            str | None, Field(description="可选游标；只读取此消息 ID 之后的上下文。")
+            str | None,
+            Field(description="可选向后增量游标；只读取此消息 ID 之后的消息。"),
+        ] = None,
+        before_message_id: Annotated[
+            str | None,
+            Field(description="可选向前分页游标；读取此消息 ID 之前最接近的一页消息。"),
         ] = None,
         limit: Annotated[int, Field(description="最多返回的消息数，范围 1 到 100。")] = 30,
     ) -> dict[str, Any]:
@@ -1006,8 +1116,22 @@ def create_mcp_servers(
         if error:
             return error
         assert group is not None
+        if since_message_id and before_message_id:
+            raise ValueError("since_message_id 与 before_message_id 不能同时提供")
         if not 1 <= limit <= 100:
             raise ValueError("limit 必须在 1 到 100 之间")
+        if not runtime.manager.is_active():
+            control = runtime.manager.control_status()
+            return _error(
+                "QQ_COLLECTION_PAUSED",
+                f"QQ 采集已暂停：{control.get('reason') or control.get('status')}",
+                next_actions=[
+                    {
+                        "label": "检查采集状态",
+                        "instruction": "在管理 App 调用 admin.get_napcat_status。",
+                    }
+                ],
+            )
         group_key = str(group["group_key"])
         sync = store.state(str(group["qq_group_id"]))
         freshness = sync_freshness(sync, config.context_freshness_seconds)
@@ -1027,9 +1151,26 @@ def create_mcp_servers(
                 ],
             )
         roles = store.member_roles(group_key)
-        messages = store.context_messages(
-            str(group["qq_group_id"]), since_message_id=since_message_id, limit=limit
-        )
+        group_id = str(group["qq_group_id"])
+        if before_message_id:
+            page = store.recent(group_id, limit=limit + 1, before_message_id=before_message_id)
+            has_more = len(page) > limit
+            messages = page[-limit:]
+            direction = "older"
+        elif since_message_id:
+            page = store.context_messages(
+                group_id,
+                since_message_id=since_message_id,
+                limit=limit + 1,
+            )
+            has_more = len(page) > limit
+            messages = page[:limit]
+            direction = "newer"
+        else:
+            page = store.recent(group_id, limit=limit + 1)
+            has_more = len(page) > limit
+            messages = page[-limit:]
+            direction = "latest"
         character = store.character(group_key)
         return {
             "notice": _UNTRUSTED_NOTICE,
@@ -1042,7 +1183,22 @@ def create_mcp_servers(
             "notes": store.notes(group_key),
             "recent_changes": store.list_changes(group_key, limit=5),
             "messages": present(messages, roles),
-            "latest_message_id": messages[-1]["message_id"] if messages else since_message_id,
+            "latest_message_id": store.latest_message_id(group_id),
+            "message_page": {
+                "direction": direction,
+                "count": len(messages),
+                "has_more": has_more,
+                "next_before_message_id": (
+                    messages[0]["message_id"]
+                    if has_more and direction in {"latest", "older"} and messages
+                    else None
+                ),
+                "next_since_message_id": (
+                    messages[-1]["message_id"]
+                    if has_more and direction == "newer" and messages
+                    else None
+                ),
+            },
             "sync": sync,
             "sync_freshness": freshness,
             "rules": rules.health(),

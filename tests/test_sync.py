@@ -7,7 +7,12 @@ import pytest
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.models import GroupTarget
 from qq_mcp_server.store import MessageStore
-from qq_mcp_server.sync import AccountMismatchError, SyncService
+from qq_mcp_server.sync import (
+    AccountMismatchError,
+    CollectionPausedError,
+    MultiGroupSyncManager,
+    SyncService,
+)
 
 
 def raw(message_id: int, *, group_id: int = 2) -> dict[str, Any]:
@@ -34,8 +39,10 @@ class FakeClient:
         self.account_id = account_id
         self.fail_cursor = fail_cursor
         self.calls: list[str | None] = []
+        self.login_calls = 0
 
     async def get_login_info(self) -> dict[str, Any]:
+        self.login_calls += 1
         return {"user_id": self.account_id}
 
     async def get_group_info(self, group_id: str) -> dict[str, Any]:
@@ -51,10 +58,15 @@ class FakeClient:
         return self.pages.get(message_seq, [])[:count]
 
 
-def service(config: AppConfig, client: FakeClient) -> SyncService:
+def service(
+    config: AppConfig,
+    client: FakeClient,
+    *,
+    history_since: str | None = "1970-01-01T00:00:00+00:00",
+) -> SyncService:
     store = MessageStore(config.database_path)
     group = store.whitelist_group("2", "测试群")
-    target = GroupTarget(str(group["group_key"]), "2", "测试群")
+    target = GroupTarget(str(group["group_key"]), "2", "测试群", history_since)
     return SyncService(config, target, client, store)  # type: ignore[arg-type]
 
 
@@ -77,6 +89,20 @@ async def test_recent_first_then_full_history_backfill(config: AppConfig) -> Non
 
 
 @pytest.mark.asyncio
+async def test_new_group_without_history_since_only_reads_recent_page(
+    config: AppConfig,
+) -> None:
+    client = FakeClient({None: [raw(5), raw(4), raw(3)], "3": [raw(2), raw(1)]})
+    sync = service(config, client, history_since=None)
+
+    result = await sync.import_all()
+
+    assert result.pages == 1
+    assert client.calls == [None]
+    assert sync.store.state("2")["initial_import_complete"] is True
+
+
+@pytest.mark.asyncio
 async def test_import_resumes_from_persisted_oldest_cursor(config: AppConfig) -> None:
     interrupted = FakeClient({None: [raw(5), raw(4), raw(3)]}, fail_cursor="3")
     sync = service(config, interrupted)
@@ -88,7 +114,7 @@ async def test_import_resumes_from_persisted_oldest_cursor(config: AppConfig) ->
     resumed_sync = service(config, resumed)
     result = await resumed_sync.import_all()
     assert result.complete is True
-    assert resumed.calls == ["3", "1"]
+    assert resumed.calls == [None, "3", "1"]
     assert resumed_sync.store.state("2")["message_count"] == 5
 
 
@@ -111,3 +137,55 @@ async def test_account_mismatch_stops_before_group_read(config: AppConfig) -> No
     with pytest.raises(AccountMismatchError, match="999"):
         await sync.verify()
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gap_resumes_one_page_per_cycle(config: AppConfig) -> None:
+    client = FakeClient({None: [raw(5), raw(4), raw(3)], "3": [raw(3), raw(2), raw(1)]})
+    sync = service(config, client, history_since=None)
+    sync._store(sync._normalize([raw(1)]))
+    sync.store.update_state(
+        account_id="1",
+        group_id="2",
+        latest_message_id="1",
+        recent_ready=True,
+        initial_import_complete=True,
+    )
+
+    first = await sync.sync_recent_page()
+    assert first.complete is False
+    assert sync.store.state("2")["reconcile_cursor"] == "3"
+    assert sync.store.state("2")["latest_message_id"] == "1"
+
+    second = await sync.sync_recent_page()
+    assert second.complete is True
+    state = sync.store.state("2")
+    assert state["reconcile_cursor"] is None
+    assert state["latest_message_id"] == "5"
+    assert state["message_count"] == 5
+    assert client.calls == [None, "3"]
+
+
+@pytest.mark.asyncio
+async def test_manager_uses_one_global_login_check_and_persists_manual_pause(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    store.whitelist_group("2", "测试群")
+    client = FakeClient({None: [raw(1)]})
+    manager = MultiGroupSyncManager(config, client, store)  # type: ignore[arg-type]
+
+    await manager.run_cycle()
+
+    assert client.login_calls == 1
+    assert client.calls == [None]
+    manager.pause_manual("账号冻结观察期")
+    assert manager.is_active() is False
+    with pytest.raises(CollectionPausedError):
+        await manager.run_cycle()
+
+    restored = MultiGroupSyncManager(config, client, store)  # type: ignore[arg-type]
+    assert restored.is_active() is False
+    result = await restored.resume()
+    assert result["control"]["status"] == "active"
+    assert restored.is_active() is True

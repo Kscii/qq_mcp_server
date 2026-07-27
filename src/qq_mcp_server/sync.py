@@ -2,21 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.models import ChatMessage, GroupTarget, SyncResult
 from qq_mcp_server.normalization import normalize_message, oldest_cursor
-from qq_mcp_server.onebot import OneBotClient
+from qq_mcp_server.onebot import (
+    OneBotClient,
+    OneBotConfigurationError,
+    OneBotSessionError,
+)
 from qq_mcp_server.store import MessageStore
 
 LOGGER = logging.getLogger(__name__)
 
 
-class AccountMismatchError(RuntimeError):
+class AccountMismatchError(OneBotSessionError):
     pass
+
+
+class CollectionPausedError(RuntimeError):
+    pass
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 def _parse_since(value: str | None) -> int | None:
@@ -25,14 +38,14 @@ def _parse_since(value: str | None) -> int | None:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise ValueError("qq.history_since 必须是包含时区的 ISO 8601 时间") from error
+        raise ValueError("history_since 必须是包含时区的 ISO 8601 时间") from error
     if parsed.tzinfo is None:
-        raise ValueError("qq.history_since 必须包含时区，例如 +08:00")
+        raise ValueError("history_since 必须包含时区，例如 +08:00")
     return int(parsed.timestamp())
 
 
 class SyncService:
-    """一个白名单群的最近同步和可中断历史回填。"""
+    """单群的一页最近补漏与可节流历史回填。"""
 
     def __init__(
         self,
@@ -46,17 +59,21 @@ class SyncService:
         self.target = target
         self.client = client
         self.store = store
-        self.since_timestamp = _parse_since(config.history_since)
-        self.limiter = limiter or asyncio.Semaphore(config.sync_concurrency)
+        self.since_timestamp = _parse_since(target.history_since or config.history_since)
+        self.limiter = limiter or asyncio.Semaphore(1)
 
-    async def verify(self) -> dict[str, Any]:
+    async def verify_login(self) -> dict[str, Any]:
         async with self.limiter:
             login = await self.client.get_login_info()
         actual = str(login.get("user_id") or "")
         if actual != self.config.account_id:
             raise AccountMismatchError(
-                f"NapCat 当前登录 QQ {actual}，配置要求 {self.config.account_id}"
+                f"NapCat 当前登录 QQ {actual or '未知'}，配置要求 {self.config.account_id}"
             )
+        return login
+
+    async def verify(self) -> dict[str, Any]:
+        login = await self.verify_login()
         async with self.limiter:
             group = await self.client.get_group_info(self.target.group_id)
         self.store.update_group_name(
@@ -67,7 +84,9 @@ class SyncService:
     async def _history(self, cursor: str | None) -> list[dict[str, Any]]:
         async with self.limiter:
             return await self.client.get_group_history(
-                self.target.group_id, self.config.page_size, message_seq=cursor
+                self.target.group_id,
+                self.config.page_size,
+                message_seq=cursor,
             )
 
     def _normalize(self, raw_messages: list[dict[str, Any]]) -> list[ChatMessage]:
@@ -81,159 +100,397 @@ class SyncService:
     def _store(self, messages: list[ChatMessage]) -> tuple[int, int]:
         return self.store.upsert(messages)
 
-    async def import_all(
-        self, progress: Callable[[int, int, int], None] | None = None
-    ) -> SyncResult:
-        await self.verify()
+    async def sync_recent_page(self) -> SyncResult:
+        """读取一页；超过一页的缺口通过 reconcile_cursor 在后续周期续传。"""
         state = self.store.state(self.target.group_id)
-        if state["initial_import_complete"]:
-            return await self.sync_recent()
-        cursor = self.store.oldest_message_seq(self.target.group_id)
-        previous_cursor: str | None = None
-        received = text_total = inserted_total = pages = 0
-        complete = False
-        newest_id = self.store.latest_message_id(self.target.group_id)
+        cursor = str(state["reconcile_cursor"]) if state["reconcile_cursor"] else None
+        boundary = (
+            str(state["reconcile_boundary_id"])
+            if state["reconcile_boundary_id"]
+            else str(state["latest_message_id"])
+            if state["latest_message_id"]
+            else None
+        )
+        pending_newest = str(state["reconcile_newest_id"]) if state["reconcile_newest_id"] else None
+        raw = await self._history(cursor)
+        normalized = self._normalize(raw)
+        text_count, inserted = self._store(normalized)
+        raw_ids = {str(item.get("message_id") or "") for item in raw}
 
-        while True:
-            raw = await self._history(cursor)
-            pages += 1
-            received += len(raw)
-            normalized = self._normalize(raw)
-            reached_start = False
-            if self.since_timestamp is not None:
-                reached_start = any(
-                    message.sent_at < self.since_timestamp for message in normalized
-                )
-                normalized = [
-                    message for message in normalized if message.sent_at >= self.since_timestamp
-                ]
-            text_count, inserted = self._store(normalized)
-            text_total += text_count
-            inserted_total += inserted
-            if normalized and newest_id is None:
-                newest = max(normalized, key=lambda item: (item.sent_at, item.message_id))
-                newest_id = newest.message_id
-            previous_cursor, cursor = cursor, oldest_cursor(raw)
-            complete = reached_start or not cursor or cursor == previous_cursor
-            self.store.update_state(
-                account_id=self.config.account_id,
-                group_id=self.target.group_id,
-                latest_message_id=newest_id,
-                oldest_message_seq=cursor,
-                recent_ready=True,
-                initial_import_complete=complete,
-                error=None,
-            )
-            if progress:
-                progress(received, inserted_total, pages)
-            if complete:
-                break
-            await asyncio.sleep(0)
+        if cursor is None and normalized:
+            pending_newest = max(
+                normalized, key=lambda item: (item.sent_at, item.message_id)
+            ).message_id
 
-        return SyncResult(received, text_total, inserted_total, pages, complete, False)
-
-    async def sync_recent(self) -> SyncResult:
-        await self.verify()
-        boundary = self.store.latest_message_id(self.target.group_id)
-        cursor: str | None = None
-        previous_cursor: str | None = None
-        received = text_total = inserted_total = pages = 0
-        boundary_found = boundary is None
-        newest_id = boundary
-
-        while True:
-            raw = await self._history(cursor)
-            pages += 1
-            received += len(raw)
-            raw_ids = {str(item.get("message_id") or "") for item in raw}
-            boundary_found = boundary_found or bool(boundary and boundary in raw_ids)
-            normalized = self._normalize(raw)
-            text_count, inserted = self._store(normalized)
-            text_total += text_count
-            inserted_total += inserted
-            if normalized and pages == 1:
-                newest_id = max(
-                    normalized, key=lambda item: (item.sent_at, item.message_id)
-                ).message_id
-            previous_cursor, cursor = cursor, oldest_cursor(raw)
-            exhausted = not cursor or cursor == previous_cursor
-            if boundary_found or exhausted:
-                break
+        next_cursor = oldest_cursor(raw)
+        boundary_found = boundary is None or bool(boundary and boundary in raw_ids)
+        exhausted = not next_cursor or next_cursor == cursor
+        complete = boundary_found or exhausted
+        current_oldest = state["oldest_message_seq"]
+        initial_complete = bool(state["initial_import_complete"])
+        if self.since_timestamp is None:
+            initial_complete = True
 
         self.store.update_state(
             account_id=self.config.account_id,
             group_id=self.target.group_id,
-            latest_message_id=newest_id,
+            latest_message_id=(pending_newest or boundary) if complete else None,
+            oldest_message_seq=(
+                next_cursor if current_oldest is None and next_cursor is not None else None
+            ),
+            reconcile_cursor=None if complete else next_cursor,
+            reconcile_boundary_id=None if complete else boundary,
+            reconcile_newest_id=None if complete else pending_newest,
+            clear_reconcile=complete,
             recent_ready=True,
+            initial_import_complete=initial_complete,
             error=None,
         )
-        return SyncResult(received, text_total, inserted_total, pages, True, boundary_found)
+        return SyncResult(
+            received=len(raw),
+            text_messages=text_count,
+            inserted=inserted,
+            pages=1,
+            complete=complete,
+            boundary_found=boundary_found,
+        )
 
-    async def run_forever(self) -> None:
+    async def backfill_one_page(self) -> SyncResult:
+        """只回填一页旧消息；未配置每群起点时不执行深回填。"""
+        state = self.store.state(self.target.group_id)
+        if self.since_timestamp is None:
+            self.store.update_state(
+                account_id=self.config.account_id,
+                group_id=self.target.group_id,
+                initial_import_complete=True,
+                error=None,
+            )
+            return SyncResult(0, 0, 0, 0, True, False)
+        if not state["recent_ready"]:
+            return await self.sync_recent_page()
+        if state["initial_import_complete"]:
+            return SyncResult(0, 0, 0, 0, True, False)
+
+        cursor = (
+            str(state["oldest_message_seq"])
+            if state["oldest_message_seq"]
+            else self.store.oldest_message_seq(self.target.group_id)
+        )
+        raw = await self._history(cursor)
+        normalized = self._normalize(raw)
+        reached_start = any(message.sent_at < self.since_timestamp for message in normalized)
+        normalized = [message for message in normalized if message.sent_at >= self.since_timestamp]
+        text_count, inserted = self._store(normalized)
+        next_cursor = oldest_cursor(raw)
+        complete = reached_start or not next_cursor or next_cursor == cursor
+        self.store.update_state(
+            account_id=self.config.account_id,
+            group_id=self.target.group_id,
+            oldest_message_seq=next_cursor,
+            recent_ready=True,
+            initial_import_complete=complete,
+            error=None,
+        )
+        return SyncResult(
+            received=len(raw),
+            text_messages=text_count,
+            inserted=inserted,
+            pages=1,
+            complete=complete,
+            boundary_found=False,
+        )
+
+    async def sync_recent(self) -> SyncResult:
+        await self.verify_login()
+        totals = [0, 0, 0, 0]
+        result = await self.sync_recent_page()
         while True:
-            try:
-                state = self.store.state(self.target.group_id)
-                # 首次只取最近一页，先让群 App 可用；之后在后台完整向前回填。
-                if not state["recent_ready"]:
-                    recent = await self.sync_recent()
-                    LOGGER.info(
-                        "群 %s 最近消息就绪：页=%d，新增=%d",
-                        self.target.group_id,
-                        recent.pages,
-                        recent.inserted,
-                    )
-                    state = self.store.state(self.target.group_id)
-                result = (
-                    await self.sync_recent()
-                    if state["initial_import_complete"]
-                    else await self.import_all()
+            totals[0] += result.received
+            totals[1] += result.text_messages
+            totals[2] += result.inserted
+            totals[3] += result.pages
+            if result.complete:
+                return SyncResult(
+                    totals[0],
+                    totals[1],
+                    totals[2],
+                    totals[3],
+                    True,
+                    result.boundary_found,
                 )
-                LOGGER.info(
-                    "群 %s 同步完成：页=%d，收到=%d，新增=%d",
-                    self.target.group_id,
-                    result.pages,
-                    result.received,
-                    result.inserted,
+            result = await self.sync_recent_page()
+
+    async def import_all(
+        self, progress: Callable[[int, int, int], None] | None = None
+    ) -> SyncResult:
+        await self.verify_login()
+        recent = await self.sync_recent_page()
+        received = recent.received
+        text_total = recent.text_messages
+        inserted_total = recent.inserted
+        pages = recent.pages
+        while self.store.state(self.target.group_id)["reconcile_cursor"]:
+            current = await self.sync_recent_page()
+            received += current.received
+            text_total += current.text_messages
+            inserted_total += current.inserted
+            pages += current.pages
+        while not self.store.state(self.target.group_id)["initial_import_complete"]:
+            current = await self.backfill_one_page()
+            received += current.received
+            text_total += current.text_messages
+            inserted_total += current.inserted
+            pages += current.pages
+            if progress:
+                progress(received, inserted_total, pages)
+            if current.complete:
+                break
+            await asyncio.sleep(
+                random.uniform(
+                    self.config.backfill_min_delay_seconds,
+                    self.config.backfill_max_delay_seconds,
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                LOGGER.warning("群 %s 同步失败：%s", self.target.group_id, error)
-                self.store.record_error(
-                    account_id=self.config.account_id,
-                    group_id=self.target.group_id,
-                    error=f"{type(error).__name__}: {error}",
-                )
-            await asyncio.sleep(self.config.poll_interval_seconds)
+            )
+        return SyncResult(received, text_total, inserted_total, pages, True, False)
 
 
 class MultiGroupSyncManager:
-    """动态跟随 WebUI 白名单启动和停止每群同步任务。"""
+    """全局单并发调度器，并持久化账号安全熔断状态。"""
 
     def __init__(self, config: AppConfig, client: OneBotClient, store: MessageStore) -> None:
         self.config = config
         self.client = client
         self.store = store
-        self.limiter = asyncio.Semaphore(config.sync_concurrency)
-        self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.limiter = asyncio.Semaphore(1)
+        self._active = asyncio.Event()
+        current = store.runtime_status("collection_control")
+        if current.get("status") in {"paused_session", "paused_manual", "paused_configuration"}:
+            return
+        if current.get("status") == "active":
+            self._active.set()
+            return
+        if config.initial_collection_paused:
+            self._set_control(
+                "paused_manual",
+                reason="首次安全发布保持暂停",
+                source="initial_configuration",
+            )
+        else:
+            self._set_control("active", reason=None, source="initial_configuration")
+            self._active.set()
+
+    def _set_control(
+        self,
+        status: str,
+        *,
+        reason: str | None,
+        source: str,
+    ) -> dict[str, Any]:
+        previous = self.store.runtime_status("collection_control")
+        value = {
+            "status": status,
+            "reason": reason,
+            "source": source,
+            "changed_at": _iso_now(),
+            "revision": int(previous.get("revision") or 0) + 1,
+            "last_resumed_at": (
+                _iso_now() if status == "active" else previous.get("last_resumed_at")
+            ),
+        }
+        self.store.set_runtime_status("collection_control", value)
+        self.store.record_runtime_event(
+            "collection_control_changed",
+            {"status": status, "reason": reason, "source": source},
+        )
+        return self.store.runtime_status("collection_control")
+
+    def control_status(self) -> dict[str, Any]:
+        stats = getattr(self.client, "stats", None)
+        return {
+            **self.store.runtime_status("collection_control"),
+            "onebot_actions": stats() if callable(stats) else {},
+        }
+
+    def is_active(self) -> bool:
+        return self._active.is_set()
+
+    def require_active(self) -> None:
+        if not self.is_active():
+            state = self.store.runtime_status("collection_control")
+            raise CollectionPausedError(
+                f"QQ 采集已暂停：{state.get('reason') or state.get('status') or '未知原因'}"
+            )
+
+    async def wait_until_active(self) -> None:
+        await self._active.wait()
+
+    def pause_manual(self, reason: str) -> dict[str, Any]:
+        text = reason.strip()
+        if not text:
+            raise ValueError("暂停原因不能为空")
+        self._active.clear()
+        return self._set_control("paused_manual", reason=text[:500], source="admin_mcp")
+
+    def pause_session(self, error: Exception, *, source: str) -> dict[str, Any]:
+        self._active.clear()
+        return self._set_control(
+            "paused_session",
+            reason=f"{type(error).__name__}: {error}"[:500],
+            source=source,
+        )
+
+    def pause_configuration(self, error: Exception, *, source: str) -> dict[str, Any]:
+        self._active.clear()
+        return self._set_control(
+            "paused_configuration",
+            reason=f"{type(error).__name__}: {error}"[:500],
+            source=source,
+        )
+
+    async def verify_account(self) -> dict[str, Any]:
+        async with self.limiter:
+            login = await self.client.get_login_info()
+        actual = str(login.get("user_id") or "")
+        if actual != self.config.account_id:
+            raise AccountMismatchError(
+                f"NapCat 当前登录 QQ {actual or '未知'}，配置要求 {self.config.account_id}"
+            )
+        return login
+
+    async def resume(self) -> dict[str, Any]:
+        try:
+            login = await self.verify_account()
+        except (OneBotSessionError, AccountMismatchError) as error:
+            self.pause_session(error, source="admin_resume_check")
+            raise
+        except OneBotConfigurationError as error:
+            self.pause_configuration(error, source="admin_resume_check")
+            raise
+        control = self._set_control("active", reason=None, source="admin_resume_check")
+        self._active.set()
+        return {"control": control, "login": login}
+
+    async def run_cycle(self) -> dict[str, Any]:
+        self.require_active()
+        login = await self.verify_account()
+        targets = self.store.sync_targets()
+        recent_results: list[dict[str, Any]] = []
+        for target in targets:
+            self.require_active()
+            service = SyncService(
+                self.config,
+                target,
+                self.client,
+                self.store,
+                self.limiter,
+            )
+            result = await service.sync_recent_page()
+            recent_results.append(
+                {
+                    "group_id": target.group_id,
+                    "received": result.received,
+                    "inserted": result.inserted,
+                    "gap_complete": result.complete,
+                }
+            )
+
+        backfill_results: list[dict[str, Any]] = []
+        eligible = [
+            target
+            for target in targets
+            if (target.history_since or self.config.history_since)
+            and not self.store.state(target.group_id)["initial_import_complete"]
+        ]
+        pages_left = self.config.backfill_pages_per_cycle
+        index = 0
+        while pages_left and eligible:
+            self.require_active()
+            target = eligible[index % len(eligible)]
+            service = SyncService(
+                self.config,
+                target,
+                self.client,
+                self.store,
+                self.limiter,
+            )
+            result = await service.backfill_one_page()
+            backfill_results.append(
+                {
+                    "group_id": target.group_id,
+                    "received": result.received,
+                    "inserted": result.inserted,
+                    "complete": result.complete,
+                }
+            )
+            pages_left -= 1
+            if result.complete:
+                eligible = [item for item in eligible if item.group_id != target.group_id]
+                index = 0
+            else:
+                index += 1
+            if pages_left and eligible:
+                await asyncio.sleep(
+                    random.uniform(
+                        self.config.backfill_min_delay_seconds,
+                        self.config.backfill_max_delay_seconds,
+                    )
+                )
+
+        cycle_result: dict[str, Any] = {
+            "ok": True,
+            "account_id": str(login.get("user_id") or ""),
+            "target_count": len(targets),
+            "recent": recent_results,
+            "backfill": backfill_results,
+            "last_success_at": _iso_now(),
+            "last_error": None,
+        }
+        self.store.set_runtime_status("sync_scheduler", cycle_result)
+        return cycle_result
 
     async def run_forever(self) -> None:
-        try:
-            while True:
-                targets = {target.group_key: target for target in self.store.sync_targets()}
-                for group_key, target in targets.items():
-                    task = self.tasks.get(group_key)
-                    if task is None or task.done():
-                        service = SyncService(
-                            self.config, target, self.client, self.store, self.limiter
-                        )
-                        self.tasks[group_key] = asyncio.create_task(
-                            service.run_forever(), name=f"qq-sync-{group_key}"
-                        )
-                for group_key in set(self.tasks) - set(targets):
-                    self.tasks.pop(group_key).cancel()
-                await asyncio.sleep(self.config.registry_refresh_seconds)
-        finally:
-            for task in self.tasks.values():
-                task.cancel()
-            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+        backoff = self.config.poll_interval_seconds
+        while True:
+            await self.wait_until_active()
+            started = asyncio.get_running_loop().time()
+            try:
+                result = await self.run_cycle()
+                LOGGER.info(
+                    "全局同步完成：群=%d，最近页=%d，回填页=%d",
+                    result["target_count"],
+                    len(result["recent"]),
+                    len(result["backfill"]),
+                )
+                backoff = self.config.poll_interval_seconds
+            except asyncio.CancelledError:
+                raise
+            except (OneBotSessionError, AccountMismatchError) as error:
+                LOGGER.error("检测到 QQ 会话异常，采集已熔断：%s", error)
+                self.pause_session(error, source="sync_scheduler")
+                continue
+            except OneBotConfigurationError as error:
+                LOGGER.error("OneBot 配置异常，采集已暂停：%s", error)
+                self.pause_configuration(error, source="sync_scheduler")
+                continue
+            except Exception as error:
+                LOGGER.warning("全局同步失败，%.0f 秒后退避重试：%s", backoff, error)
+                previous = self.store.runtime_status("sync_scheduler")
+                self.store.set_runtime_status(
+                    "sync_scheduler",
+                    {
+                        "ok": False,
+                        "last_success_at": previous.get("last_success_at"),
+                        "last_error": f"{type(error).__name__}: {error}"[:500],
+                        "retry_in_seconds": backoff,
+                    },
+                )
+                self.store.record_runtime_event(
+                    "sync_cycle_failed",
+                    {"error": f"{type(error).__name__}: {error}"[:500]},
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.config.unreachable_backoff_max_seconds)
+                continue
+
+            elapsed = asyncio.get_running_loop().time() - started
+            await asyncio.sleep(max(0.0, self.config.poll_interval_seconds - elapsed))

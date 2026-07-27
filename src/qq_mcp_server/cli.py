@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -13,7 +14,7 @@ from qq_mcp_server.application import build_services, run_server
 from qq_mcp_server.config import ConfigError, default_config_text, load_config
 from qq_mcp_server.napcat import prepare_napcat_config
 from qq_mcp_server.rules import RuleIndex, RuleSource, build_rule_index
-from qq_mcp_server.store import MessageStore
+from qq_mcp_server.store import MessageStore, backup_database
 from qq_mcp_server.sync import SyncService
 
 
@@ -33,6 +34,10 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("run", help="持续多群同步并启动 Admin/群 MCP")
     status = commands.add_parser("status", help="查看白名单群、同步和规则索引状态")
     status.add_argument("--json", action="store_true", help="输出 JSON")
+    backup = commands.add_parser("backup", help="使用 SQLite 在线备份当前数据库")
+    backup.add_argument("--output-dir", type=Path, help="备份目录，默认数据库同级 backups")
+    pause = commands.add_parser("pause-collection", help="不连接 QQ，持久化暂停全部采集")
+    pause.add_argument("--reason", default="部署维护暂停", help="记录在诊断状态中的暂停原因")
     build_rules = commands.add_parser("build-rules", help="离线构建三本规则书的私有只读索引")
     build_rules.add_argument("--investigator", type=Path, required=True, help="调查员手册 PDF")
     build_rules.add_argument("--keeper", type=Path, required=True, help="核心规则书 PDF")
@@ -151,6 +156,37 @@ def main() -> None:
             asyncio.run(run_server(load_config(arguments.config)))
         elif arguments.command == "status":
             _status(arguments.config, arguments.json)
+        elif arguments.command == "backup":
+            config = load_config(arguments.config)
+            directory = arguments.output_dir or config.database_path.parent / "backups"
+            target = backup_database(config.database_path, directory)
+            print(f"✓ 数据库备份：{target}")
+        elif arguments.command == "pause-collection":
+            config = load_config(arguments.config)
+            store = MessageStore(config.database_path)
+            previous = store.runtime_status("collection_control")
+            now = datetime.now(UTC).isoformat()
+            reason = str(arguments.reason)[:500]
+            store.set_runtime_status(
+                "collection_control",
+                {
+                    "status": "paused_manual",
+                    "reason": reason,
+                    "source": "cli",
+                    "changed_at": now,
+                    "revision": int(previous.get("revision") or 0) + 1,
+                    "last_resumed_at": previous.get("last_resumed_at"),
+                },
+            )
+            store.record_runtime_event(
+                "collection_control_changed",
+                {
+                    "status": "paused_manual",
+                    "reason": reason,
+                    "source": "cli",
+                },
+            )
+            print("✓ QQ 采集已持久化暂停；未连接 OneBot。")
         elif arguments.command == "build-rules":
             _build_rules(arguments)
         elif arguments.command == "prepare-napcat":

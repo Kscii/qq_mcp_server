@@ -39,6 +39,24 @@ def test_onebot_must_remain_loopback(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_onebot_can_use_private_tailscale_https(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    text = (
+        default_config_text(account_id="123")
+        .replace(
+            "http://127.0.0.1:3000",
+            "https://collector.example-tailnet.ts.net:8444",
+        )
+        .replace(
+            "http://127.0.0.1:3001/_events",
+            "https://collector.example-tailnet.ts.net:8445/_events",
+        )
+    )
+    path.write_text(text, encoding="utf-8")
+    config = load_config(path)
+    assert config.onebot_url.endswith(":8444")
+
+
 def test_napcat_webui_must_be_private_tailscale_https(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     text = default_config_text(account_id="123").replace(

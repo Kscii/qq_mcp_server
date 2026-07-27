@@ -388,6 +388,10 @@ async def test_recovery_requires_post_and_only_writes_fixed_request(
     config: AppConfig,
 ) -> None:
     store, _, _, app = services(config)
+    store.set_runtime_status(
+        "sync_scheduler",
+        {"ok": False, "last_error": "OneBotTransportError: 连接失败"},
+    )
     token = store.issue_capability(
         kind="napcat_recovery", group_key=None, issued_to="local", ttl_seconds=600
     )

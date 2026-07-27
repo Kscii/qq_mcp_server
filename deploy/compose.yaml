@@ -5,7 +5,7 @@ services:
     image: docker.io/mlikiowa/napcat-docker@sha256:11d72e50b6edc01b20f1a7611a250720e61412fe96184e3c70c3b8cf976744e1
     container_name: qq-mcp-server-napcat
     network_mode: host
-    restart: unless-stopped
+    restart: "on-failure:2"
     init: true
     environment:
       ACCOUNT: ${QQ_ACCOUNT_ID:?请在 .env 设置 QQ_ACCOUNT_ID}

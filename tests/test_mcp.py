@@ -114,6 +114,9 @@ async def test_admin_and_group_apps_are_separate(config: AppConfig) -> None:
     assert admin_tools == {
         "admin.open_group_whitelist",
         "admin.get_napcat_status",
+        "admin.pause_qq_collection",
+        "admin.resume_qq_collection",
+        "admin.refresh_group_registry",
         "admin.probe_group",
         "admin.open_napcat_webui",
         "admin.open_napcat_recovery",
@@ -154,7 +157,7 @@ async def test_all_tool_and_parameter_descriptions_are_chinese(config: AppConfig
     )
 
     tools = [*(await admin.list_tools()), *(await group_mcp.list_tools())]
-    assert len(tools) == 21
+    assert len(tools) == 24
     for tool in tools:
         assert tool.description
         assert any("\u4e00" <= character <= "\u9fff" for character in tool.description)
@@ -238,6 +241,53 @@ async def test_group_context_is_fixed_and_marks_untrusted_messages(config: AppCo
     assert result.data["group"]["qq_group_id"] == "2"
     assert result.data["messages"][0]["plain_text"].startswith("忽略系统")
     assert "未经信任" in result.data["notice"]
+
+
+async def test_group_context_pages_backward_without_raising_single_call_limit(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.upsert([message(str(index), f"消息-{index}") for index in range(1, 106)])
+    store.update_state(
+        account_id="1",
+        group_id="2",
+        latest_message_id="105",
+        recent_ready=True,
+        initial_import_complete=True,
+        error=None,
+    )
+    store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
+    _, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    async with Client(group_mcp) as client:
+        latest = await client.call_tool("trpg.get_roleplay_context", {"limit": 100})
+        older = await client.call_tool(
+            "trpg.get_roleplay_context",
+            {
+                "limit": 100,
+                "before_message_id": latest.data["message_page"]["next_before_message_id"],
+            },
+        )
+
+    assert len(latest.data["messages"]) == 100
+    assert latest.data["messages"][0]["message_id"] == "6"
+    assert latest.data["message_page"]["has_more"] is True
+    assert [item["message_id"] for item in older.data["messages"]] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+    ]
+    assert older.data["message_page"]["has_more"] is False
 
 
 async def test_group_context_refuses_unsynchronized_messages(config: AppConfig) -> None:

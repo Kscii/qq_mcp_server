@@ -3,12 +3,17 @@
 account_id = "0"
 onebot_url = "http://127.0.0.1:3000"
 onebot_sse_url = "http://127.0.0.1:3001/_events"
-poll_interval_seconds = 15
+poll_interval_seconds = 60
 registry_refresh_seconds = 5
-group_discovery_interval_seconds = 60
-context_freshness_seconds = 60
-sync_concurrency = 3
+group_discovery_interval_seconds = 900
+context_freshness_seconds = 180
+sync_concurrency = 1
 page_size = 100
+backfill_min_delay_seconds = 2
+backfill_max_delay_seconds = 5
+backfill_pages_per_cycle = 3
+unreachable_backoff_max_seconds = 900
+initial_collection_paused = false
 request_timeout_seconds = 20
 history_timeout_seconds = 90
 

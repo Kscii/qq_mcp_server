@@ -1,9 +1,12 @@
 # Google Cloud 部署
 
-生产设计是一台 Ubuntu VM、Docker Compose，以及 NapCat、应用和可选 Caddy 三个容器。
-NapCat 与应用使用 host network，但分别只监听 `127.0.0.1:3000/3001/6099` 和
-`127.0.0.1:8000`；Caddy 是唯一公网入口。建议 2 vCPU、4 GB 内存、30 GB 磁盘和
-2 GB swap。
+当前生产设计是一台 Ubuntu VM、Docker Compose，以及 NapCat、应用和可选 Caddy 三个
+容器。NapCat 与应用使用 host network，但分别只监听
+`127.0.0.1:3000/3001/6099` 和 `127.0.0.1:8000`；Caddy 是唯一公网入口。建议 2 vCPU、
+4 GB 内存、30 GB 磁盘和 2 GB swap。
+
+应用发布与 QQ 客户端生命周期严格分离：普通部署只替换应用和可选 Caddy，不拉取、
+准备、启动、重建或重启 NapCat。NapCat 只在明确维护窗口中操作。
 
 ## 一次性准备
 
@@ -19,7 +22,24 @@ Docker/Compose，创建权限收紧的 `/var/lib/qq_mcp_server`、`cards`、`rul
 ```
 
 脚本生成权限为 `0600` 的 `.env` 与 `deploy.env`。`.env` 只包含 QQ 账号、持久化路径和
-OneBot token，不再包含目标群；群在服务运行后通过管理 App 白名单加入。
+OneBot token，不再包含目标群；群在服务运行后通过管理 App 白名单加入。首次配置默认
+`INITIAL_COLLECTION_PAUSED=true`。
+
+NapCat 首次初始化必须单独明确确认：
+
+```bash
+CONFIRM_NAPCAT_MAINTENANCE=yes ./maintain-napcat.sh initialize
+```
+
+后续只有主动升级 NapCat 时才运行
+`CONFIRM_NAPCAT_MAINTENANCE=yes ./maintain-napcat.sh update`。普通应用发布不调用这两个
+动作。若只需在线收紧已有容器的重启策略，执行：
+
+```bash
+./maintain-napcat.sh apply-restart-policy
+```
+
+该动作只把策略改为连续失败最多重启两次，不重启容器。
 
 首次启动时可以先用 SSH 转发打开 NapCat：
 
@@ -29,7 +49,9 @@ gcloud compute ssh qq-mcp-server --zone australia-southeast1-a \
 ```
 
 打开 `http://127.0.0.1:6099/webui` 扫码。QQ 登录目录在持久卷，正常重启无需重新扫码；
-QQ 仍可能因设备授权或风控要求重新授权。不要在部署配置中保存主用 QQ 明文密码。
+QQ 仍可能因设备授权或风控要求重新授权。不要在部署配置中保存主用 QQ 明文密码。确认
+账号无误后，在管理 MCP 调用 `admin.resume_qq_collection`；它只做一次账号校验，成功后
+才解除持久化暂停。
 
 ## Tailscale 私有 NapCat 面板
 
@@ -64,8 +86,24 @@ NAPCAT_CONTROL_DIR=/data/control
 MCP 返回值；最终页面也只有已登录 Tailnet 的设备能够访问。
 
 部署会安装 root 所有的 `qq-mcp-napcat-recovery.path/service`。应用没有 Docker Socket，
-只能写入固定 `restart-napcat.request`；助手校验 UID、0600 权限和十分钟冷却后，只执行
-`docker restart --time 30 qq-mcp-server-napcat`。不要把这个助手改成接受容器名或命令参数。
+只能写入固定 `restart-napcat.request`；助手校验 UID、0600 权限、一小时冷却和 24 小时
+最多两次的预算后，只执行 `docker restart --time 30 qq-mcp-server-napcat`。登录失效、
+账号不匹配或互踢不会触发恢复入口，而会持久化暂停等待人工处理。不要把这个助手改成
+接受容器名或命令参数。
+
+## 账号风控期间的安全发布
+
+账号被冻结或待人工重新登录时：
+
+1. NapCat 若仍在运行，只人工停止一次，不再反复启动验证。
+2. 保持 `INITIAL_COLLECTION_PAUSED=true`；不要调用恢复采集接口。
+3. 发布新应用。首次 v2→v3 升级会先只停止旧应用，使用 SQLite 在线备份并校验，再写入
+   持久化暂停状态；不会连接 OneBot。
+4. 新应用健康检查失败时，发布脚本先原子恢复 v2 备份，再回滚旧镜像。
+5. 账号解冻并在固定设备完成登录后，先看缓存状态，再由用户明确调用
+   `admin.resume_qq_collection`。
+
+应用健康检查只打开数据库和规则索引，不探测 QQ，因此冻结期间也能安全完成部署。
 
 ## 离线构建规则索引
 
@@ -163,9 +201,21 @@ gcloud compute ssh "$INSTANCE" \
 4. 构建镜像并推送到 Artifact Registry。
 5. 以镜像 digest 部署；健康检查失败则恢复上一 digest。
 
-普通 `main` 推送只运行 CI。`deploy.sh` 会准备安全 NapCat 配置并启动容器；应用健康检查
-调用 `status --json`，不要求 QQ 当时在线。SQLite、人物卡、规则索引和 OAuth 状态都在
+普通 `main` 推送只运行 CI。`deploy.sh` 仅更新应用和可选 Caddy；应用健康检查调用
+`status --json`，不要求 QQ 当时在线。SQLite、人物卡、规则索引和 OAuth 状态都在
 `DATA_DIR` 持久卷中。
 
-v0.2 是不兼容的新数据模型。首次部署请使用新的 `/data/trpg.sqlite3`，不要覆盖或导入
-旧 qq_mcp_server/Dice Echo 数据；所有群重新加入白名单，人物卡重新上传。
+v0.5 首次发布会把本项目 v0.4 的 schema v2 原子升级为 v3，并保留迁移前备份；不需要
+重新加入白名单或上传人物卡。旧 qq_mcp_server/Dice Echo 数据仍不支持迁移。
+
+## 未来将 NapCat 移到住宅网络
+
+公网 MCP、OAuth、Caddy 和 SQLite 默认继续留在 GCP。到澳洲后先保持这套部署观察至少
+30 天；若账号仍有明显地域风险，再只把 NapCat 移到长期稳定的住宅设备。住宅端不需要
+公网 IP 或端口转发：GCP VM 与住宅设备加入同一个 Tailnet，应用的 `ONEBOT_URL` 和
+`onebot_sse_url` 改为住宅设备的 `.ts.net` HTTPS 私网地址，并用 Tailscale ACL 只允许
+GCP VM 访问。
+
+切换时必须先暂停采集并确保旧 NapCat 已停止，再启动新位置；任何时候都不得让两个
+NapCat 实例同时登录同一 QQ。此方案只改变 QQ 客户端位置，不改变 ChatGPT 访问公网 MCP
+的路径。

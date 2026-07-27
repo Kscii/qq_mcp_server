@@ -16,6 +16,23 @@ compose() {
     docker compose --env-file .env --env-file deploy.env "$@"
 }
 
+data_dir="$(sed -n 's/^DATA_DIR=//p' .env | tail -n 1)"
+[ -n "$data_dir" ] || data_dir="/var/lib/qq_mcp_server"
+case "$data_dir" in
+    /*) ;;
+    *) echo "DATA_DIR 必须是绝对路径" >&2; exit 2 ;;
+esac
+case "$data_dir" in
+    *[!A-Za-z0-9._/-]*) echo "DATA_DIR 包含不安全字符" >&2; exit 2 ;;
+esac
+database_container_path="$(sed -n 's/^DATABASE_PATH=//p' .env | tail -n 1)"
+[ -n "$database_container_path" ] || database_container_path="/data/trpg.sqlite3"
+case "$database_container_path" in
+    /data/*) database_path="$data_dir/${database_container_path#/data/}" ;;
+    *) echo "DATABASE_PATH 必须位于 /data 持久卷内" >&2; exit 2 ;;
+esac
+migration_marker="$data_dir/control/pre-v3-backup.path"
+
 if [ "$(id -u)" -eq 0 ]; then
     ./install-recovery-helper.sh
 elif ! systemctl is-enabled --quiet qq-mcp-napcat-recovery.path; then
@@ -42,21 +59,95 @@ fi
 if ! docker image inspect "$app_image" >/dev/null 2>&1; then
     docker pull "$app_image"
 fi
-compose pull napcat
-compose run --rm --no-deps --entrypoint qq_mcp_server app \
-    -c /config/config.toml prepare-napcat /data/napcat/config
+schema_version="$(
+    python3 -c '
+import os, sqlite3, sys
+path = sys.argv[1]
+if not os.path.isfile(path):
+    print("")
+else:
+    connection = sqlite3.connect(path)
+    try:
+        row = connection.execute(
+            "SELECT value FROM app_metadata WHERE key = '\''schema_version'\''"
+        ).fetchone()
+        print(row[0] if row else "")
+    except sqlite3.Error:
+        print("")
+    finally:
+        connection.close()
+' "$database_path"
+)"
+if [ "$schema_version" = "2" ] && [ "${SKIP_SAFETY_MIGRATION:-0}" != "1" ]; then
+    # 旧进程不会动态读取新写入的暂停状态，所以迁移前只停止应用。
+    # NapCat 的容器、登录目录和会话均不在应用发布链中。
+    compose stop app >/dev/null 2>&1 || true
+    backup_output="$(
+        compose run --rm --no-deps app -c /config/config.toml backup \
+            --output-dir /data/backups
+    )"
+    printf '%s\n' "$backup_output"
+    backup_container_path="$(
+        printf '%s\n' "$backup_output" |
+            sed -n 's/^✓ 数据库备份：//p' |
+            tail -n 1
+    )"
+    case "$backup_container_path" in
+        /data/backups/*)
+            backup_path="$data_dir/${backup_container_path#/data/}"
+            ;;
+        *)
+            echo "无法确认 v2 数据库备份路径，拒绝迁移" >&2
+            exit 1
+            ;;
+    esac
+    if [ ! -f "$backup_path" ]; then
+        echo "v2 数据库备份不存在：$backup_path" >&2
+        exit 1
+    fi
+    control_dir="$(dirname "$migration_marker")"
+    if [ ! -d "$control_dir" ]; then
+        install -d -m 0750 \
+            -o "$(stat -c %u "$data_dir")" \
+            -g "$(stat -c %g "$data_dir")" \
+            "$control_dir"
+    fi
+    printf '%s\n' "$backup_path" >"$migration_marker"
+    chmod 0600 "$migration_marker"
+    compose run --rm --no-deps app -c /config/config.toml pause-collection \
+        --reason "v0.5 安全升级：等待账号解冻后人工恢复"
+    migrated_schema="$(
+        python3 -c '
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+try:
+    row = connection.execute(
+        "SELECT value FROM app_metadata WHERE key = '\''schema_version'\''"
+    ).fetchone()
+    print(row[0] if row else "")
+finally:
+    connection.close()
+' "$database_path"
+    )"
+    if [ "$migrated_schema" != "3" ]; then
+        echo "数据库未完成 v3 迁移，拒绝启动新应用" >&2
+        exit 1
+    fi
+    compose run --rm --no-deps app -c /config/config.toml status --json >/dev/null
+fi
 
 if grep -q '^PUBLIC_DOMAIN=.' .env; then
     compose --profile public pull caddy
-    compose --profile public up -d --remove-orphans
+    compose --profile public up -d --no-deps app caddy
 else
-    compose up -d napcat app --remove-orphans
+    compose up -d --no-deps app
 fi
 
 attempt=0
 while [ "$attempt" -lt 18 ]; do
     health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' qq-mcp-server-app 2>/dev/null || true)"
     if [ "$health" = "healthy" ]; then
+        rm -f "$migration_marker"
         compose ps
         exit 0
     fi

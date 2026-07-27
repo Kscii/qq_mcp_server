@@ -38,6 +38,26 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def backup_database(path: Path, directory: Path) -> Path:
+    source_path = path.expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"数据库不存在：{source_path}")
+    target_directory = directory.expanduser().resolve()
+    target_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    target = target_directory / f"{source_path.stem}.pre-v3.{timestamp}.sqlite3"
+    with (
+        closing(sqlite3.connect(source_path)) as source,
+        closing(sqlite3.connect(target)) as destination,
+    ):
+        source.backup(destination)
+        integrity = destination.execute("PRAGMA integrity_check").fetchone()
+        if integrity is None or str(integrity[0]).lower() != "ok":
+            raise RuntimeError("数据库备份完整性检查失败")
+    target.chmod(0o600)
+    return target
+
+
 def _pointer_parts(pointer: str) -> list[str]:
     if not pointer.startswith("/"):
         raise ValueError("JSON Pointer 必须以 / 开头")
@@ -166,21 +186,26 @@ class MessageStore:
             }
             if existing_tables and "app_metadata" not in existing_tables:
                 raise ValueError(
-                    "检测到旧版或外部 SQLite；v0.2 不执行迁移，请配置一个新的 database 路径"
+                    "检测到旧版 Dice Echo 或外部 SQLite；此类数据库不执行迁移，"
+                    "请配置一个新的 database 路径"
                 )
+            schema_version: str | None = None
             if "app_metadata" in existing_tables:
                 schema = connection.execute(
                     "SELECT value FROM app_metadata WHERE key = 'schema_version'"
                 ).fetchone()
-                if schema is None or str(schema[0]) != "2":
+                schema_version = str(schema[0]) if schema else None
+                if schema_version not in {"2", "3"}:
                     raise ValueError("数据库 schema_version 不受支持；请使用新的 database 路径")
             connection.executescript(
                 """
+                BEGIN IMMEDIATE;
+
                 CREATE TABLE IF NOT EXISTS app_metadata (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-                INSERT OR IGNORE INTO app_metadata(key, value) VALUES ('schema_version', '2');
+                INSERT OR IGNORE INTO app_metadata(key, value) VALUES ('schema_version', '3');
 
                 CREATE TABLE IF NOT EXISTS groups (
                     group_key TEXT PRIMARY KEY,
@@ -189,6 +214,7 @@ class MessageStore:
                     module_title TEXT NOT NULL DEFAULT '',
                     display_label TEXT NOT NULL DEFAULT '',
                     roleplay_guidance TEXT NOT NULL DEFAULT '',
+                    history_since TEXT,
                     roleplay_enabled INTEGER NOT NULL DEFAULT 0,
                     whitelisted INTEGER NOT NULL DEFAULT 1,
                     version INTEGER NOT NULL DEFAULT 0,
@@ -235,6 +261,9 @@ class MessageStore:
                     account_id TEXT NOT NULL,
                     latest_message_id TEXT,
                     oldest_message_seq TEXT,
+                    reconcile_cursor TEXT,
+                    reconcile_boundary_id TEXT,
+                    reconcile_newest_id TEXT,
                     recent_ready INTEGER NOT NULL DEFAULT 0,
                     initial_import_complete INTEGER NOT NULL DEFAULT 0,
                     last_sync_at TEXT,
@@ -261,6 +290,15 @@ class MessageStore:
                     value_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_runtime_events_time
+                    ON runtime_events (created_at DESC, id DESC);
 
                 CREATE TABLE IF NOT EXISTS characters (
                     group_key TEXT PRIMARY KEY REFERENCES groups(group_key) ON DELETE CASCADE,
@@ -315,6 +353,25 @@ class MessageStore:
                 );
                 """
             )
+            if schema_version == "2":
+                group_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(groups)")
+                }
+                if "history_since" not in group_columns:
+                    connection.execute("ALTER TABLE groups ADD COLUMN history_since TEXT")
+                sync_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(sync_state)")
+                }
+                for column in (
+                    "reconcile_cursor",
+                    "reconcile_boundary_id",
+                    "reconcile_newest_id",
+                ):
+                    if column not in sync_columns:
+                        connection.execute(f"ALTER TABLE sync_state ADD COLUMN {column} TEXT")
+                connection.execute(
+                    "UPDATE app_metadata SET value = '3' WHERE key = 'schema_version'"
+                )
             connection.commit()
         self.path.chmod(0o600)
 
@@ -347,6 +404,7 @@ class MessageStore:
                 group_key=str(row["group_key"]),
                 group_id=str(row["qq_group_id"]),
                 group_name=str(row["qq_group_name"]),
+                history_since=str(row["history_since"]) if row["history_since"] else None,
             )
             for row in self.list_groups()
         ]
@@ -425,8 +483,9 @@ class MessageStore:
         module_title: str | None,
         display_label: str | None,
         roleplay_guidance: str | None,
+        history_since: str | None = None,
     ) -> dict[str, Any]:
-        values: dict[str, str] = {}
+        values: dict[str, str | None] = {}
         if module_title is not None:
             values["module_title"] = module_title.strip()
         if display_label is not None:
@@ -439,6 +498,20 @@ class MessageStore:
                     f"{len(guidance)} 字，不能超过 {ROLEPLAY_GUIDANCE_MAX_LENGTH} 字"
                 )
             values["roleplay_guidance"] = guidance
+        history_changed = history_since is not None
+        if history_since is not None:
+            normalized = history_since.strip()
+            if normalized:
+                try:
+                    parsed = datetime.fromisoformat(normalized)
+                except ValueError as error:
+                    raise ValueError("history_since 必须是 ISO 8601 时间") from error
+                if parsed.tzinfo is None:
+                    raise ValueError("history_since 必须包含时区，例如 +08:00")
+                normalized = parsed.isoformat()
+                values["history_since"] = normalized
+            else:
+                values["history_since"] = None
         if not values:
             raise ValueError("至少提供一个要修改的配置")
         with closing(self._connect()) as connection, connection:
@@ -449,6 +522,16 @@ class MessageStore:
                        WHERE group_key = ?""",
                 (*values.values(), _utc_now(), group_key),
             )
+            if history_changed:
+                group_id = connection.execute(
+                    "SELECT qq_group_id FROM groups WHERE group_key = ?", (group_key,)
+                ).fetchone()
+                assert group_id is not None
+                connection.execute(
+                    """UPDATE sync_state SET initial_import_complete = 0
+                       WHERE group_id = ?""",
+                    (str(group_id[0]),),
+                )
         return self.get_group(group_key)
 
     def member_roles(self, group_key: str) -> dict[str, Any]:
@@ -634,6 +717,37 @@ class MessageStore:
             value = {}
         return {**value, "updated_at": str(row["updated_at"])}
 
+    def record_runtime_event(self, event_type: str, details: dict[str, Any]) -> None:
+        if not event_type or len(event_type) > 80:
+            raise ValueError("运行事件类型格式错误")
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """INSERT INTO runtime_events (event_type, details_json, created_at)
+                   VALUES (?, ?, ?)""",
+                (event_type, _json(details), _utc_now()),
+            )
+            connection.execute("DELETE FROM runtime_events WHERE created_at < ?", (cutoff,))
+
+    def runtime_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit 必须在 1 到 1000 之间")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """SELECT id, event_type, details_json, created_at
+                   FROM runtime_events ORDER BY id DESC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "event_type": str(row["event_type"]),
+                "details": _unjson(row["details_json"], {}),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
     def upsert(self, messages: Iterable[ChatMessage]) -> tuple[int, int]:
         batch = list(messages)
         if not batch:
@@ -699,7 +813,9 @@ class MessageStore:
             row = connection.execute(
                 """
                 SELECT state.account_id, state.latest_message_id,
-                       state.oldest_message_seq, state.recent_ready,
+                       state.oldest_message_seq, state.reconcile_cursor,
+                       state.reconcile_boundary_id, state.reconcile_newest_id,
+                       state.recent_ready,
                        state.initial_import_complete, state.last_sync_at, state.last_error,
                        count(message.id) AS message_count,
                        min(message.sent_at) AS oldest_time,
@@ -724,6 +840,10 @@ class MessageStore:
         group_id: str,
         latest_message_id: str | None = None,
         oldest_message_seq: str | None = None,
+        reconcile_cursor: str | None = None,
+        reconcile_boundary_id: str | None = None,
+        reconcile_newest_id: str | None = None,
+        clear_reconcile: bool = False,
         recent_ready: bool | None = None,
         initial_import_complete: bool | None = None,
         error: str | None = None,
@@ -734,12 +854,25 @@ class MessageStore:
                 """
                 INSERT INTO sync_state (
                     group_id, account_id, latest_message_id, oldest_message_seq,
+                    reconcile_cursor, reconcile_boundary_id, reconcile_newest_id,
                     recent_ready, initial_import_complete, last_sync_at, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (group_id) DO UPDATE SET
                     account_id = excluded.account_id,
                     latest_message_id = COALESCE(excluded.latest_message_id, sync_state.latest_message_id),
                     oldest_message_seq = COALESCE(excluded.oldest_message_seq, sync_state.oldest_message_seq),
+                    reconcile_cursor = CASE
+                        WHEN ? THEN NULL
+                        ELSE COALESCE(excluded.reconcile_cursor, sync_state.reconcile_cursor) END,
+                    reconcile_boundary_id = CASE
+                        WHEN ? THEN NULL
+                        ELSE COALESCE(
+                            excluded.reconcile_boundary_id, sync_state.reconcile_boundary_id
+                        ) END,
+                    reconcile_newest_id = CASE
+                        WHEN ? THEN NULL
+                        ELSE COALESCE(excluded.reconcile_newest_id, sync_state.reconcile_newest_id)
+                        END,
                     recent_ready = CASE WHEN ? IS NULL THEN sync_state.recent_ready ELSE excluded.recent_ready END,
                     initial_import_complete = CASE
                         WHEN ? IS NULL THEN sync_state.initial_import_complete
@@ -752,10 +885,16 @@ class MessageStore:
                     account_id,
                     latest_message_id,
                     oldest_message_seq,
+                    reconcile_cursor,
+                    reconcile_boundary_id,
+                    reconcile_newest_id,
                     int(bool(recent_ready)),
                     int(bool(initial_import_complete)),
                     now,
                     error,
+                    int(clear_reconcile),
+                    int(clear_reconcile),
+                    int(clear_reconcile),
                     recent_ready,
                     initial_import_complete,
                 ),
@@ -837,6 +976,13 @@ class MessageStore:
             parameters.extend([group_id, before_message_id])
         parameters.append(limit)
         with closing(self._connect()) as connection:
+            if before_message_id:
+                anchor = connection.execute(
+                    "SELECT 1 FROM messages WHERE group_id = ? AND message_id = ?",
+                    (group_id, before_message_id),
+                ).fetchone()
+                if anchor is None:
+                    raise ValueError("before_message_id 不属于当前群或已不存在")
             rows = connection.execute(
                 f"""SELECT message_id, sent_at, sender_id, sender_display, plain_text,
                             reply_to_message_id, contains_unsupported_media

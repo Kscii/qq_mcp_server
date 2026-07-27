@@ -4,7 +4,7 @@
 
 | 内容 | 唯一入口 | 原因 |
 |---|---|---|
-| QQ 账号、OneBot 回环地址、数据库/卡片/规则路径、OAuth、公网地址、同步参数 | TOML/环境变量，部署时很少改 | 服务基础设施和秘密不能交给群聊决定 |
+| QQ 账号、OneBot 私有地址、数据库/卡片/规则路径、OAuth、公网地址、同步参数 | TOML/环境变量，部署时很少改 | 服务基础设施和秘密不能交给群聊决定 |
 | QQ 群加入/移出采集白名单 | 管理 MCP 签发的一次性网页 | 这是唯一需要人工确认群列表的配置 UI |
 | QQ 登录与 NapCat 恢复 | 管理 MCP 签发的一次性确认页 | 长期 Token 不进入 AI；重启还需要人工确认 |
 | 模组名、显示名、本群长期 RP 准则 | `admin.update_group_profile` | AI 可先读版本并可靠地结构化更新；准则最多 4096 字 |
@@ -27,12 +27,15 @@ qq_mcp_server build-rules --investigator INVESTIGATOR.pdf --keeper KEEPER.pdf --
 qq_mcp_server sync
 qq_mcp_server run
 qq_mcp_server status [--json]
+qq_mcp_server backup
+qq_mcp_server pause-collection --reason "维护"
 qq_mcp_server prepare-napcat DIRECTORY
 ```
 
 `setup` 只创建基础 TOML。`build-rules` 原子重建私有规则索引。`sync` 对当前所有白名单
-群执行一次最近同步和历史回填；持续运行时不必另开 `sync`。`status` 不连接 QQ，适合
-健康检查。`prepare-napcat` 生成仅监听回环、只开 HTTP API 的 NapCat 配置。
+群执行一次最近同步和已配置日期的历史回填；持续运行时不必另开 `sync`。`status`、
+`backup` 和 `pause-collection` 都不连接 QQ，适合健康检查、升级备份和安全维护。
+`prepare-napcat` 生成仅监听回环、只开 HTTP API 的 NapCat 配置。
 
 ## TOML 与环境变量
 
@@ -41,16 +44,21 @@ qq_mcp_server prepare-napcat DIRECTORY
 `[qq]`：
 
 - `account_id`：NapCat 登录 QQ；可用 `QQ_ACCOUNT_ID` 覆盖。
-- `onebot_url`：只允许 `127.0.0.1`、`localhost` 或 `::1` 的明文 HTTP；可用 `ONEBOT_URL` 覆盖。
-- `onebot_sse_url`：只允许回环地址上的 `/_events`；默认 `127.0.0.1:3001`。
-- `poll_interval_seconds`：每群最近消息轮询周期，5–300 秒。
+- `onebot_url`：允许回环 HTTP，或仅 Tailnet 可达的 `.ts.net` HTTPS；可用 `ONEBOT_URL` 覆盖。
+- `onebot_sse_url`：同上且路径必须为 `/_events`；默认 `127.0.0.1:3001`。
+- `poll_interval_seconds`：全局最近消息对账周期，默认 60 秒。
 - `registry_refresh_seconds`：白名单任务刷新周期，1–60 秒。
-- `group_discovery_interval_seconds`：主动强制刷新群列表的周期，默认 60 秒。
-- `context_freshness_seconds`：跑团上下文允许的最大成功轮询年龄，默认 60 秒。
-- `sync_concurrency`：所有群共享的 OneBot 并发上限，1–16。
+- `group_discovery_interval_seconds`：主动强制刷新群列表的周期，默认 900 秒。
+- `context_freshness_seconds`：跑团上下文允许的最大成功对账年龄，默认 180 秒。
+- `sync_concurrency`：兼容旧配置；运行期固定使用全局单并发。
 - `page_size`：历史分页大小，1–500。
+- `backfill_min_delay_seconds` / `backfill_max_delay_seconds`：旧历史页间随机等待，默认 2–5 秒。
+- `backfill_pages_per_cycle`：每轮全局最多回填页数，默认 3。
+- `unreachable_backoff_max_seconds`：网络不可达退避上限，默认 900 秒。
+- `initial_collection_paused` / `INITIAL_COLLECTION_PAUSED`：首次创建安全状态时是否暂停。
 - `request_timeout_seconds` / `history_timeout_seconds`：普通/历史接口超时。
-- `history_since`：可选 ISO 8601 下限；省略则回填 NapCat 当前能取得的全部历史。
+- `history_since`：仅兼容旧部署的全局下限；新部署通过 `admin.update_group_profile`
+  为每群设置，未设置时只保留最近一页并等待新消息。
 
 `[storage]`：
 
@@ -77,8 +85,9 @@ qq_mcp_server prepare-napcat DIRECTORY
 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`、`MCP_JWT_SIGNING_KEY` 和
 `MCP_STORAGE_ENCRYPTION_KEY`。
 
-v0.2 不迁移旧版 qq_mcp_server 或 Dice Echo 数据，也不迁移旧人物卡。请使用新的数据库、
-重新加入白名单并重新上传卡；不要把旧 SQLite 改名后继续使用。
+本项目 v0.4 的 schema v2 会在首次 v0.5 启动前备份并原子升级到 v3，保留白名单、人物卡
+和消息。旧版 qq_mcp_server 或 Dice Echo 数据仍不迁移，也不要把它们的 SQLite 改名后
+继续使用。
 
 ## 第一次配置一个群
 
@@ -97,13 +106,17 @@ v0.2 不迁移旧版 qq_mcp_server 或 Dice Echo 数据，也不迁移旧人物�
 
 - `admin.open_group_whitelist()`：签发一次性白名单页。
 - `admin.get_napcat_status()`：诊断登录、OneBot、SSE、群注册表和逐群同步新鲜度。
+- `admin.pause_qq_collection(reason)`：持久化暂停全部 QQ 读取。
+- `admin.resume_qq_collection()`：用户重新登录后单次校验账号并恢复。
+- `admin.refresh_group_registry()`：带 60 秒冷却的强制 `no_cache` 群列表刷新。
 - `admin.probe_group(group_id)`：列表缺失时直接验证当前 QQ 是否能访问指定群。
 - `admin.open_napcat_webui()`：签发不向 AI 暴露长期 Token 的私有面板入口。
 - `admin.open_napcat_recovery()`：取得用户明确同意后签发重启二次确认页。
 - `admin.list_groups()`：群、固定 URL、版本、同步和下一步。
 - `admin.get_group_setup(group_key)`：单群完整准备清单。
 - `admin.list_group_members(group_key, query?, limit)`：读取稳定 QQ 号。
-- `admin.update_group_profile(group_key, expected_version, ...)`：模组/标签/最多 4096 字的长期 RP 准则。
+- `admin.update_group_profile(group_key, expected_version, ...)`：模组、标签、每群回填起点和
+  最多 4096 字的长期 RP 准则。
 - `admin.set_member_roles(group_key, expected_version, player, kp?, dice_bot?)`：成员角色。
 - `admin.set_group_enabled(group_key, expected_version, enabled)`：群级启停。
 
@@ -114,7 +127,8 @@ v0.2 不迁移旧版 qq_mcp_server 或 Dice Echo 数据，也不迁移旧人物�
 
 - `trpg.get_status()`：即使停用也可用的准备与诊断。
 - `trpg.open_campaign_dashboard()`：签发绑定当前群、一小时有效且可重复浏览的只读档案页。
-- `trpg.get_roleplay_context(since_message_id?, limit)`：正常拟定回复的单次聚合读取。
+- `trpg.get_roleplay_context(since_message_id?, before_message_id?, limit)`：正常拟定回复的
+  单次聚合读取；两个游标互斥，默认 30、最多 100 条，并返回下一页游标。
 - `trpg.get_character_card(view="roleplay"|"full")`：当前卡和可选单元格来源。
 - `trpg.search_messages(query?, sender_qq_user_id?, after?, before?, limit)`：旧消息条件搜索。
 - `trpg.search_coc_rules(query, book="all"|"investigator"|"keeper"|"magic", limit)`：规则检索。

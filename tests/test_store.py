@@ -10,7 +10,7 @@ from qq_mcp_server.models import (
     ChatMessage,
     NoteOperation,
 )
-from qq_mcp_server.store import MessageStore, VersionConflictError
+from qq_mcp_server.store import MessageStore, VersionConflictError, backup_database
 
 
 def test_old_database_is_rejected_instead_of_partially_migrated(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -21,6 +21,72 @@ def test_old_database_is_rejected_instead_of_partially_migrated(tmp_path) -> Non
     connection.close()
     with pytest.raises(ValueError, match="不执行迁移"):
         MessageStore(path)
+
+
+def test_schema_v2_is_atomically_migrated_to_v3(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    path = tmp_path / "v2.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE app_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO app_metadata VALUES ('schema_version', '2');
+        CREATE TABLE groups (
+            group_key TEXT PRIMARY KEY,
+            qq_group_id TEXT NOT NULL UNIQUE,
+            qq_group_name TEXT NOT NULL,
+            module_title TEXT NOT NULL DEFAULT '',
+            display_label TEXT NOT NULL DEFAULT '',
+            roleplay_guidance TEXT NOT NULL DEFAULT '',
+            roleplay_enabled INTEGER NOT NULL DEFAULT 0,
+            whitelisted INTEGER NOT NULL DEFAULT 1,
+            version INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE sync_state (
+            group_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            latest_message_id TEXT,
+            oldest_message_seq TEXT,
+            recent_ready INTEGER NOT NULL DEFAULT 0,
+            initial_import_complete INTEGER NOT NULL DEFAULT 0,
+            last_sync_at TEXT,
+            last_error TEXT
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    MessageStore(path)
+
+    migrated = sqlite3.connect(path)
+    assert migrated.execute(
+        "SELECT value FROM app_metadata WHERE key = 'schema_version'"
+    ).fetchone() == ("3",)
+    group_columns = {row[1] for row in migrated.execute("PRAGMA table_info(groups)")}
+    sync_columns = {row[1] for row in migrated.execute("PRAGMA table_info(sync_state)")}
+    assert "history_since" in group_columns
+    assert {
+        "reconcile_cursor",
+        "reconcile_boundary_id",
+        "reconcile_newest_id",
+    } <= sync_columns
+    migrated.close()
+
+
+def test_online_backup_is_integrity_checked_and_private(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    store.whitelist_group("2", "测试群")
+
+    backup = backup_database(config.database_path, config.database_path.parent / "backups")
+
+    assert backup.is_file()
+    assert backup.stat().st_mode & 0o777 == 0o600
+    connection = sqlite3.connect(backup)
+    assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert connection.execute("SELECT count(*) FROM groups").fetchone() == (1,)
+    connection.close()
 
 
 def message(message_id: str, *, group_id: str = "2") -> ChatMessage:
@@ -149,6 +215,31 @@ def test_version_conflict_prevents_overwrite(config) -> None:  # type: ignore[no
         assert error.current_version == 1
     else:
         raise AssertionError("expected VersionConflictError")
+
+
+def test_history_since_is_per_group_and_does_not_delete_messages(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.upsert([message("1")])
+    store.update_state(
+        account_id="1",
+        group_id="2",
+        recent_ready=True,
+        initial_import_complete=True,
+    )
+
+    updated = store.update_group_profile(
+        str(group["group_key"]),
+        expected_version=0,
+        module_title=None,
+        display_label=None,
+        roleplay_guidance=None,
+        history_since="2026-07-01T00:00:00+08:00",
+    )
+
+    assert updated["history_since"] == "2026-07-01T00:00:00+08:00"
+    assert store.state("2")["initial_import_complete"] is False
+    assert store.state("2")["message_count"] == 1
 
 
 def test_roleplay_guidance_accepts_4096_characters_and_rejects_more(config) -> None:  # type: ignore[no-untyped-def]

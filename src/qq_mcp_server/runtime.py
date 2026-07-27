@@ -11,8 +11,17 @@ import httpx
 
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.normalization import normalize_message
-from qq_mcp_server.onebot import OneBotClient, OneBotError
+from qq_mcp_server.onebot import (
+    OneBotClient,
+    OneBotConfigurationError,
+    OneBotSessionError,
+)
 from qq_mcp_server.store import MessageStore
+from qq_mcp_server.sync import (
+    AccountMismatchError,
+    CollectionPausedError,
+    MultiGroupSyncManager,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,13 +45,20 @@ def _age_seconds(value: object) -> float | None:
 
 def sync_freshness(state: dict[str, Any], maximum_age_seconds: float) -> dict[str, Any]:
     age = _age_seconds(state.get("last_sync_at"))
-    fresh = age is not None and age <= maximum_age_seconds and not state.get("last_error")
+    reconcile_in_progress = bool(state.get("reconcile_cursor"))
+    fresh = (
+        age is not None
+        and age <= maximum_age_seconds
+        and not state.get("last_error")
+        and not reconcile_in_progress
+    )
     return {
         "fresh": fresh,
         "age_seconds": round(age, 3) if age is not None else None,
         "maximum_age_seconds": maximum_age_seconds,
         "last_sync_at": state.get("last_sync_at"),
         "last_error": state.get("last_error"),
+        "reconcile_in_progress": reconcile_in_progress,
     }
 
 
@@ -55,6 +71,7 @@ class NapCatRuntime:
         client: OneBotClient,
         store: MessageStore,
         onebot_token: str,
+        manager: MultiGroupSyncManager | None = None,
         *,
         sse_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
@@ -62,19 +79,36 @@ class NapCatRuntime:
         self.client = client
         self.store = store
         self._onebot_token = onebot_token
+        self.manager = manager or MultiGroupSyncManager(config, client, store)
         self._sse_transport = sse_transport
         self._registry_lock = asyncio.Lock()
 
-    async def refresh_registry(self) -> list[dict[str, Any]]:
+    async def refresh_registry(self, *, force: bool = False) -> list[dict[str, Any]]:
+        self.manager.require_active()
         async with self._registry_lock:
+            previous = self.store.runtime_status("group_registry")
+            if force:
+                last_attempt = previous.get("last_attempt_at")
+                if isinstance(last_attempt, str):
+                    try:
+                        age = (_utc_now() - datetime.fromisoformat(last_attempt)).total_seconds()
+                    except ValueError:
+                        age = 60
+                    if age < 60:
+                        raise RuntimeError(
+                            f"群列表强制刷新冷却中，请等待 {max(1, int(60 - age))} 秒"
+                        )
+            attempt_at = _iso_now()
             try:
-                login = await self.client.get_login_info()
-                actual = str(login.get("user_id") or "")
-                if actual != self.config.account_id:
-                    raise OneBotError(
-                        f"NapCat 当前登录 QQ {actual or '未知'}，配置要求 {self.config.account_id}"
-                    )
-                groups = await self.client.get_group_list()
+                async with self.manager.limiter:
+                    login = await self.client.get_login_info()
+                    actual = str(login.get("user_id") or "")
+                    if actual != self.config.account_id:
+                        raise AccountMismatchError(
+                            f"NapCat 当前登录 QQ {actual or '未知'}，"
+                            f"配置要求 {self.config.account_id}"
+                        )
+                    groups = await self.client.get_group_list()
                 for group in groups:
                     self.store.upsert_group_candidate(
                         str(group["group_id"]),
@@ -88,13 +122,19 @@ class NapCatRuntime:
                         "account_id": actual,
                         "group_count": len(groups),
                         "group_ids": [str(item["group_id"]) for item in groups],
+                        "last_attempt_at": attempt_at,
                         "last_success_at": _iso_now(),
                         "last_error": None,
                     },
                 )
                 return groups
+            except (OneBotSessionError, AccountMismatchError) as error:
+                self.manager.pause_session(error, source="group_registry")
+                raise
+            except OneBotConfigurationError as error:
+                self.manager.pause_configuration(error, source="group_registry")
+                raise
             except Exception as error:
-                previous = self.store.runtime_status("group_registry")
                 self.store.set_runtime_status(
                     "group_registry",
                     {
@@ -102,6 +142,7 @@ class NapCatRuntime:
                         "account_id": previous.get("account_id"),
                         "group_count": previous.get("group_count"),
                         "group_ids": previous.get("group_ids", []),
+                        "last_attempt_at": attempt_at,
                         "last_success_at": previous.get("last_success_at"),
                         "last_error": f"{type(error).__name__}: {error}"[:500],
                     },
@@ -111,12 +152,18 @@ class NapCatRuntime:
     async def probe_group(self, group_id: str) -> dict[str, Any]:
         if not group_id.isdigit():
             raise ValueError("group_id 只能包含数字")
+        self.manager.require_active()
         registry_error: Exception | None = None
         groups: list[dict[str, Any]] = []
         try:
-            groups = await self.refresh_registry()
+            groups = await self.refresh_registry(force=True)
+        except CollectionPausedError:
+            raise
+        except (OneBotSessionError, AccountMismatchError, OneBotConfigurationError):
+            raise
         except Exception as error:
             registry_error = error
+        self.manager.require_active()
         listed = next(
             (item for item in groups if str(item["group_id"]) == group_id),
             None,
@@ -140,12 +187,14 @@ class NapCatRuntime:
             }
 
         try:
-            info = await self.client.get_group_info(group_id, no_cache=True)
+            async with self.manager.limiter:
+                info = await self.client.get_group_info(group_id, no_cache=True)
             group_name = str(info.get("group_name") or group_id)
             verification_method: str | None = None
             member_error: Exception | None = None
             try:
-                members = await self.client.get_group_member_list(group_id, no_cache=True)
+                async with self.manager.limiter:
+                    members = await self.client.get_group_member_list(group_id, no_cache=True)
                 if any(
                     str(member.get("qq_user_id") or "") == self.config.account_id
                     for member in members
@@ -170,7 +219,8 @@ class NapCatRuntime:
 
             if verification_method is None:
                 try:
-                    await self.client.get_group_history(group_id, 1)
+                    async with self.manager.limiter:
+                        await self.client.get_group_history(group_id, 1)
                     verification_method = "readable_history"
                 except Exception as history_error:
                     selected_error = member_error or history_error
@@ -192,6 +242,12 @@ class NapCatRuntime:
                 "verified_until": verified_until,
                 "registry_error": str(registry_error) if registry_error else None,
             }
+        except (OneBotSessionError, AccountMismatchError) as error:
+            self.manager.pause_session(error, source="probe_group")
+            raise
+        except OneBotConfigurationError as error:
+            self.manager.pause_configuration(error, source="probe_group")
+            raise
         except Exception as error:
             text = f"{type(error).__name__}: {error}"
             status = (
@@ -211,14 +267,10 @@ class NapCatRuntime:
             return {"status": status, "group_id": group_id, "error": text[:500]}
 
     async def get_status(self) -> dict[str, Any]:
-        registry_error: Exception | None = None
-        try:
-            groups = await self.refresh_registry()
-        except Exception as error:
-            registry_error = error
-            groups = []
         registry = self.store.runtime_status("group_registry")
         sse = self.store.runtime_status("sse")
+        scheduler = self.store.runtime_status("sync_scheduler")
+        control = self.manager.control_status()
         registry_ids = {str(item) for item in registry.get("group_ids", [])}
         sync_groups: list[dict[str, Any]] = []
         sync_degraded = False
@@ -250,16 +302,23 @@ class NapCatRuntime:
             for candidate in self.store.list_group_candidates()
         )
 
-        error_text = str(registry_error or registry.get("last_error") or "")
-        if registry_error:
+        registry_error = str(registry.get("last_error") or "")
+        scheduler_error = str(scheduler.get("last_error") or "")
+        if control.get("status") == "paused_session":
+            status = "login_required"
+        elif control.get("status") == "paused_manual":
+            status = "collection_paused"
+        elif control.get("status") == "paused_configuration":
+            status = "configuration_error"
+        elif scheduler_error:
             status = (
                 "login_required"
-                if any(word in error_text for word in ("未登录", "登录 QQ", "登录状态"))
+                if any(word in scheduler_error for word in ("未登录", "登录 QQ", "登录状态"))
                 else "onebot_unreachable"
             )
         elif sync_degraded:
             status = "sync_degraded"
-        elif registry_suspect:
+        elif registry_error or registry_suspect:
             status = "group_registry_suspect"
         else:
             status = "healthy"
@@ -271,21 +330,44 @@ class NapCatRuntime:
                     "instruction": "调用 admin.open_napcat_webui，检查登录或扫码。",
                 }
             )
-        if status in {"group_registry_suspect", "onebot_unreachable"}:
+        if status == "onebot_unreachable":
             next_actions.append(
                 {
                     "label": "必要时恢复 NapCat",
-                    "instruction": "取得用户明确同意后调用 admin.open_napcat_recovery。",
+                    "instruction": (
+                        "仅当 NapCat 进程持续不可达且用户明确同意时调用 "
+                        "admin.open_napcat_recovery；群列表缺失不能作为重启理由。"
+                    ),
+                }
+            )
+        if status in {"login_required", "collection_paused"}:
+            next_actions.append(
+                {
+                    "label": "人工恢复采集",
+                    "instruction": (
+                        "完成 QQ 登录后，由用户明确要求调用 admin.resume_qq_collection。"
+                    ),
+                }
+            )
+        if status == "group_registry_suspect":
+            next_actions.append(
+                {
+                    "label": "刷新或直接验证群",
+                    "instruction": (
+                        "先调用 admin.refresh_group_registry；若已知群号仍缺失，"
+                        "调用 admin.probe_group。不要重启 NapCat。"
+                    ),
                 }
             )
         return {
             "status": status,
             "expected_account_id": self.config.account_id,
             "current_account_id": registry.get("account_id"),
-            "onebot_reachable": registry_error is None,
+            "onebot_reachable": not bool(scheduler_error),
+            "collection_control": control,
+            "sync_scheduler": scheduler,
             "group_registry": {
                 **registry,
-                "live_group_count": len(groups) if groups else registry.get("group_count"),
                 "suspect": registry_suspect,
             },
             "sse": sse,
@@ -294,8 +376,16 @@ class NapCatRuntime:
         }
 
     async def handle_event(self, event: dict[str, Any]) -> None:
+        if not self.manager.is_active():
+            return
         self_id = str(event.get("self_id") or "")
         if self_id and self_id != self.config.account_id:
+            self.manager.pause_session(
+                AccountMismatchError(
+                    f"SSE 事件来自 QQ {self_id}，配置要求 {self.config.account_id}"
+                ),
+                source="sse_event",
+            )
             return
         post_type = str(event.get("post_type") or "")
         group_id = str(event.get("group_id") or "")
@@ -336,8 +426,15 @@ class NapCatRuntime:
             transport=self._sse_transport,
         ) as client:
             while True:
+                await self.manager.wait_until_active()
                 try:
                     async with client.stream("GET", self.config.onebot_sse_url) as response:
+                        if response.status_code in {401, 403}:
+                            self.manager.pause_configuration(
+                                OneBotConfigurationError("SSE OneBot Token 或访问控制配置错误"),
+                                source="sse",
+                            )
+                            raise CollectionPausedError("SSE 配置熔断")
                         response.raise_for_status()
                         self.store.set_runtime_status(
                             "sse",
@@ -353,6 +450,8 @@ class NapCatRuntime:
                         delay = 1.0
                         data: list[str] = []
                         async for line in response.aiter_lines():
+                            if not self.manager.is_active():
+                                raise CollectionPausedError("QQ 采集已暂停")
                             if line.startswith("data:"):
                                 data.append(line[5:].lstrip())
                                 continue
@@ -380,6 +479,17 @@ class NapCatRuntime:
                     raise RuntimeError("SSE 连接已结束")
                 except asyncio.CancelledError:
                     raise
+                except CollectionPausedError:
+                    self.store.set_runtime_status(
+                        "sse",
+                        {
+                            "connected": False,
+                            "connected_at": self.store.runtime_status("sse").get("connected_at"),
+                            "last_event_at": self.store.runtime_status("sse").get("last_event_at"),
+                            "last_error": "collection_paused",
+                        },
+                    )
+                    continue
                 except Exception as error:
                     self.store.set_runtime_status(
                         "sse",
@@ -396,6 +506,7 @@ class NapCatRuntime:
 
     async def run_discovery_forever(self) -> None:
         while True:
+            await self.manager.wait_until_active()
             try:
                 await self.refresh_registry()
             except asyncio.CancelledError:

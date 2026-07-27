@@ -214,12 +214,20 @@ def register_web_routes(
         token = str(request.path_params["token"])
         try:
             capability = store.capability(token, kind="napcat_recovery")
+            status = await runtime.get_status()
+            if status["status"] != "onebot_unreachable":
+                raise ValueError("NapCat 当前并非持续不可达，恢复请求已拒绝")
+            if status["collection_control"].get("status") in {
+                "paused_session",
+                "paused_configuration",
+            }:
+                raise ValueError("登录或配置熔断期间禁止通过重启恢复")
             if request.method == "GET":
                 return _page(
                     "确认恢复 NapCat",
                     '<div class="card"><p><strong>此操作会重启 NapCat。</strong></p>'
                     "<p>消息同步会短暂中断；QQ 可能要求重新扫码登录。"
-                    "每 10 分钟最多执行一次。</p>"
+                    "每次至少间隔 1 小时，24 小时最多执行 2 次。</p>"
                     '<form method="post"><button class="danger" type="submit">'
                     "确认重启 NapCat</button></form></div>",
                 )

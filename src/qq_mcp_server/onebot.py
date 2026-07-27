@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -9,6 +12,30 @@ import httpx
 
 class OneBotError(RuntimeError):
     pass
+
+
+class OneBotTransportError(OneBotError):
+    pass
+
+
+class OneBotSessionError(OneBotError):
+    pass
+
+
+class OneBotConfigurationError(OneBotError):
+    pass
+
+
+_SESSION_ERROR_MARKERS = (
+    "未登录",
+    "登录状态",
+    "登录已失效",
+    "登录失效",
+    "kickedoffline",
+    "kicked off",
+    "not logged",
+    "login required",
+)
 
 
 class OneBotClient:
@@ -36,6 +63,16 @@ class OneBotClient:
         if not token:
             raise ValueError("ONEBOT_ACCESS_TOKEN 不能为空")
         self._history_timeout = history_timeout
+        self._stats: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "calls": 0,
+                "successes": 0,
+                "errors": 0,
+                "total_latency_ms": 0.0,
+                "last_called_at": None,
+                "last_error": None,
+            }
+        )
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={"Authorization": f"Bearer {token}"},
@@ -51,6 +88,10 @@ class OneBotClient:
     ) -> Any:
         if action not in self._ALLOWED_ACTIONS:
             raise OneBotError(f"拒绝调用非只读 OneBot 动作：{action}")
+        started = time.monotonic()
+        stats = self._stats[action]
+        stats["calls"] += 1
+        stats["last_called_at"] = datetime.now(UTC).isoformat()
         attempts = 3
         for attempt in range(attempts):
             try:
@@ -59,26 +100,73 @@ class OneBotClient:
                     json=payload or {},
                     timeout=self._history_timeout if history else None,
                 )
+                if response.status_code in {401, 403}:
+                    raise OneBotConfigurationError(f"{action} OneBot Token 或访问控制配置错误")
                 response.raise_for_status()
                 body = response.json()
                 break
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as error:
                 if attempt + 1 == attempts:
-                    raise OneBotError(f"{action} 连接失败：{type(error).__name__}") from error
+                    selected_error = OneBotTransportError(
+                        f"{action} 连接失败：{type(error).__name__}"
+                    )
+                    stats["errors"] += 1
+                    stats["last_error"] = str(selected_error)
+                    stats["total_latency_ms"] += (time.monotonic() - started) * 1000
+                    raise selected_error from error
                 await asyncio.sleep(0.5 * (2**attempt))
             except httpx.ReadTimeout as error:
                 # 不立刻重复历史请求，避免 NapCat 仍处理上一次请求时形成堆积。
-                raise OneBotError(f"{action} 读取超时") from error
+                selected_error = OneBotTransportError(f"{action} 读取超时")
+                stats["errors"] += 1
+                stats["last_error"] = str(selected_error)
+                stats["total_latency_ms"] += (time.monotonic() - started) * 1000
+                raise selected_error from error
+            except OneBotConfigurationError as error:
+                stats["errors"] += 1
+                stats["last_error"] = str(error)
+                stats["total_latency_ms"] += (time.monotonic() - started) * 1000
+                raise
             except (httpx.HTTPError, json.JSONDecodeError) as error:
-                raise OneBotError(f"{action} 请求失败：{type(error).__name__}") from error
+                selected_error = OneBotTransportError(f"{action} 请求失败：{type(error).__name__}")
+                stats["errors"] += 1
+                stats["last_error"] = str(selected_error)
+                stats["total_latency_ms"] += (time.monotonic() - started) * 1000
+                raise selected_error from error
         else:  # pragma: no cover
             raise AssertionError("重试循环未执行")
         if not isinstance(body, dict):
             raise OneBotError(f"{action} 返回的不是对象")
         if body.get("status") != "ok" or body.get("retcode") != 0:
             message = body.get("wording") or body.get("message") or "未知错误"
-            raise OneBotError(f"{action} 失败：{message}")
+            text = f"{action} 失败：{message}"
+            error_type = (
+                OneBotSessionError
+                if any(marker in text.lower() for marker in _SESSION_ERROR_MARKERS)
+                else OneBotError
+            )
+            response_error: OneBotError = error_type(text)
+            stats["errors"] += 1
+            stats["last_error"] = text
+            stats["total_latency_ms"] += (time.monotonic() - started) * 1000
+            raise response_error
+        stats["successes"] += 1
+        stats["last_error"] = None
+        stats["total_latency_ms"] += (time.monotonic() - started) * 1000
         return body.get("data")
+
+    def stats(self) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for action, value in self._stats.items():
+            calls = int(value["calls"])
+            result[action] = {
+                **value,
+                "average_latency_ms": (
+                    round(float(value["total_latency_ms"]) / calls, 3) if calls else None
+                ),
+                "total_latency_ms": round(float(value["total_latency_ms"]), 3),
+            }
+        return result
 
     async def get_login_info(self) -> dict[str, Any]:
         data = await self._action("get_login_info")

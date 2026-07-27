@@ -31,6 +31,7 @@ printf '%s\n' \
     "OAUTH_STORAGE_DIR=/data/oauth" \
     "NAPCAT_WEBUI_CONFIG_PATH=/data/napcat/config/webui.json" \
     "NAPCAT_CONTROL_DIR=/data/control" \
+    "INITIAL_COLLECTION_PAUSED=true" \
     "ONEBOT_ACCESS_TOKEN=$token" >.env
 unset token
 printf 'APP_IMAGE=%s\n' "$2" >deploy.env

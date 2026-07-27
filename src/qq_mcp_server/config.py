@@ -22,6 +22,11 @@ class AppConfig:
     context_freshness_seconds: float
     sync_concurrency: int
     page_size: int
+    backfill_min_delay_seconds: float
+    backfill_max_delay_seconds: float
+    backfill_pages_per_cycle: int
+    unreachable_backoff_max_seconds: float
+    initial_collection_paused: bool
     request_timeout_seconds: float
     history_timeout_seconds: float
     history_since: str | None
@@ -94,6 +99,17 @@ def _integer(value: object, name: str, minimum: int, maximum: int) -> int:
     return result
 
 
+def _boolean(value: object, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} 必须是布尔值")
+
+
 def load_config(path: Path) -> AppConfig:
     path = path.expanduser().resolve()
     try:
@@ -113,20 +129,49 @@ def load_config(path: Path) -> AppConfig:
     account_id = _require_digits(_env("QQ_ACCOUNT_ID", qq.get("account_id")), "qq.account_id")
     onebot_url = str(_env("ONEBOT_URL", qq.get("onebot_url", "http://127.0.0.1:3000")))
     parsed = urlsplit(onebot_url)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
-        raise ConfigError("qq.onebot_url 必须是本机回环 HTTP 地址")
+    onebot_hostname = parsed.hostname or ""
+    local_onebot = parsed.scheme == "http" and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+    private_onebot = (
+        parsed.scheme == "https"
+        and bool(onebot_hostname)
+        and onebot_hostname.endswith(".ts.net")
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
+    if not (local_onebot or private_onebot):
+        raise ConfigError("qq.onebot_url 必须是本机回环 HTTP 或 Tailscale .ts.net HTTPS 地址")
     onebot_sse_url = str(
         _env("ONEBOT_SSE_URL", qq.get("onebot_sse_url", "http://127.0.0.1:3001/_events"))
     )
     parsed_sse = urlsplit(onebot_sse_url)
+    sse_hostname = parsed_sse.hostname or ""
+    local_sse = parsed_sse.scheme == "http" and parsed_sse.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
+    private_sse = (
+        parsed_sse.scheme == "https"
+        and bool(sse_hostname)
+        and sse_hostname.endswith(".ts.net")
+        and not parsed_sse.username
+        and not parsed_sse.password
+    )
     if (
-        parsed_sse.scheme != "http"
-        or parsed_sse.hostname not in {"127.0.0.1", "localhost", "::1"}
+        not (local_sse or private_sse)
         or parsed_sse.path != "/_events"
         or parsed_sse.query
         or parsed_sse.fragment
     ):
-        raise ConfigError("qq.onebot_sse_url 必须是本机回环 HTTP /_events 地址")
+        raise ConfigError(
+            "qq.onebot_sse_url 必须是回环 HTTP 或 Tailscale .ts.net HTTPS 的 /_events"
+        )
 
     raw_emails = access.get("allowed_google_emails", [])
     if not isinstance(raw_emails, list) or any(not isinstance(item, str) for item in raw_emails):
@@ -160,30 +205,66 @@ def load_config(path: Path) -> AppConfig:
         ):
             raise ConfigError("server.napcat_webui_url 必须是 https://<设备>.ts.net:8443/webui")
 
+    backfill_min_delay_seconds = _number(
+        qq.get("backfill_min_delay_seconds", 2),
+        "qq.backfill_min_delay_seconds",
+        0,
+        60,
+    )
+    backfill_max_delay_seconds = _number(
+        qq.get("backfill_max_delay_seconds", 5),
+        "qq.backfill_max_delay_seconds",
+        0,
+        120,
+    )
+    if backfill_max_delay_seconds < backfill_min_delay_seconds:
+        raise ConfigError("qq.backfill_max_delay_seconds 不能小于 qq.backfill_min_delay_seconds")
+
     return AppConfig(
         account_id=account_id,
         onebot_url=onebot_url.rstrip("/"),
         onebot_sse_url=onebot_sse_url,
         poll_interval_seconds=_number(
-            qq.get("poll_interval_seconds", 15), "qq.poll_interval_seconds", 5, 300
+            qq.get("poll_interval_seconds", 60), "qq.poll_interval_seconds", 30, 900
         ),
         registry_refresh_seconds=_number(
             qq.get("registry_refresh_seconds", 5), "qq.registry_refresh_seconds", 1, 60
         ),
         group_discovery_interval_seconds=_number(
-            qq.get("group_discovery_interval_seconds", 60),
+            qq.get("group_discovery_interval_seconds", 900),
             "qq.group_discovery_interval_seconds",
-            15,
-            3600,
+            60,
+            86400,
         ),
         context_freshness_seconds=_number(
-            qq.get("context_freshness_seconds", 60),
+            qq.get("context_freshness_seconds", 180),
             "qq.context_freshness_seconds",
-            30,
-            600,
+            60,
+            1800,
         ),
-        sync_concurrency=_integer(qq.get("sync_concurrency", 3), "qq.sync_concurrency", 1, 16),
+        sync_concurrency=_integer(qq.get("sync_concurrency", 1), "qq.sync_concurrency", 1, 16),
         page_size=_integer(qq.get("page_size", 100), "qq.page_size", 1, 500),
+        backfill_min_delay_seconds=backfill_min_delay_seconds,
+        backfill_max_delay_seconds=backfill_max_delay_seconds,
+        backfill_pages_per_cycle=_integer(
+            qq.get("backfill_pages_per_cycle", 3),
+            "qq.backfill_pages_per_cycle",
+            1,
+            10,
+        ),
+        unreachable_backoff_max_seconds=_number(
+            qq.get("unreachable_backoff_max_seconds", 900),
+            "qq.unreachable_backoff_max_seconds",
+            60,
+            3600,
+        ),
+        initial_collection_paused=_boolean(
+            _env(
+                "INITIAL_COLLECTION_PAUSED",
+                qq.get("initial_collection_paused", False),
+            ),
+            "qq.initial_collection_paused",
+        ),
         request_timeout_seconds=_number(
             qq.get("request_timeout_seconds", 20), "qq.request_timeout_seconds", 1, 120
         ),
@@ -248,15 +329,20 @@ def default_config_text(*, account_id: str) -> str:
 account_id = "{account_id}"
 onebot_url = "http://127.0.0.1:3000"
 onebot_sse_url = "http://127.0.0.1:3001/_events"
-poll_interval_seconds = 15
+poll_interval_seconds = 60
 registry_refresh_seconds = 5
-group_discovery_interval_seconds = 60
-context_freshness_seconds = 60
-sync_concurrency = 3
+group_discovery_interval_seconds = 900
+context_freshness_seconds = 180
+sync_concurrency = 1
 page_size = 100
+backfill_min_delay_seconds = 2
+backfill_max_delay_seconds = 5
+backfill_pages_per_cycle = 3
+unreachable_backoff_max_seconds = 900
+initial_collection_paused = false
 request_timeout_seconds = 20
 history_timeout_seconds = 90
-# 留空表示后台回填 NapCat 可获取的全部历史。
+# 兼容旧部署的全局回填下限；新配置应通过管理 MCP 为每个群单独设置。
 # history_since = "2026-01-01T00:00:00+08:00"
 
 [storage]
