@@ -10,7 +10,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, cast, override
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
@@ -40,7 +40,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from qq_mcp_server import __version__
 from qq_mcp_server.ai_instructions import ADMIN_INSTRUCTIONS, GROUP_INSTRUCTIONS, PROMPT_VERSION
@@ -1333,6 +1333,29 @@ class _WhitelistPathGuard:
                     response = JSONResponse({"error": "group_not_whitelisted"}, status_code=404)
                     await response(scope, receive, send)
                     return
+
+                encoded_group_key = quote(group_key, safe="")
+
+                async def send_with_exact_resource_metadata(message: Message) -> None:
+                    if message["type"] == "http.response.start":
+                        headers: list[tuple[bytes, bytes]] = []
+                        for name, value in message.get("headers", []):
+                            if name.lower() == b"www-authenticate":
+                                challenge = value.decode("latin-1")
+                                challenge = challenge.replace("%7Bgroup_key%7D", encoded_group_key)
+                                challenge = challenge.replace("%7bgroup_key%7d", encoded_group_key)
+                                challenge = challenge.replace("{group_key}", encoded_group_key)
+                                value = challenge.encode("latin-1")
+                            headers.append((name, value))
+                        message = {**message, "headers": headers}
+                    await send(message)
+
+                await self.app(
+                    scope,
+                    receive,
+                    send_with_exact_resource_metadata,
+                )
+                return
         await self.app(scope, receive, send)
 
 

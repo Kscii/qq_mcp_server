@@ -523,6 +523,51 @@ async def test_oauth_metadata_uses_each_exact_mcp_resource(
     ]
 
 
+async def test_dynamic_group_oauth_challenge_uses_exact_resource_metadata(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-secret")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "jwt-signing-key-for-tests")
+    monkeypatch.setenv("MCP_STORAGE_ENCRYPTION_KEY", "storage-encryption-key-for-tests")
+    public_config = replace(
+        config,
+        public_url="https://mcp.example.com",
+        allowed_google_emails=("keeper@example.com",),
+    )
+    store, _, _, app = services(public_config)
+    group = store.whitelist_group("2", "测试群")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        },
+    }
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/mcp/groups/{group['group_key']}",
+            json=payload,
+            headers=headers,
+        )
+
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == (
+        "Bearer "
+        'resource_metadata="https://mcp.example.com/'
+        ".well-known/oauth-protected-resource/mcp/groups/"
+        f'{group["group_key"]}"'
+    )
+
+
 async def test_combined_http_app_preserves_bearer_authentication_middleware(
     config: AppConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
