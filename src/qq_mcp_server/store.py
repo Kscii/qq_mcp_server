@@ -11,7 +11,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from qq_mcp_server.models import CardOperation, ChatMessage, GroupTarget, NoteOperation
+from qq_mcp_server.models import (
+    ROLEPLAY_GUIDANCE_MAX_LENGTH,
+    CardOperation,
+    ChatMessage,
+    GroupTarget,
+    NoteOperation,
+)
 
 
 def _utc_now() -> str:
@@ -427,8 +433,11 @@ class MessageStore:
             values["display_label"] = display_label.strip()
         if roleplay_guidance is not None:
             guidance = roleplay_guidance.strip()
-            if len(guidance) > 800:
-                raise ValueError("roleplay_guidance 不能超过 800 字")
+            if len(guidance) > ROLEPLAY_GUIDANCE_MAX_LENGTH:
+                raise ValueError(
+                    "roleplay_guidance 当前为 "
+                    f"{len(guidance)} 字，不能超过 {ROLEPLAY_GUIDANCE_MAX_LENGTH} 字"
+                )
             values["roleplay_guidance"] = guidance
         if not values:
             raise ValueError("至少提供一个要修改的配置")
@@ -867,6 +876,7 @@ class MessageStore:
         start_timestamp: int | None,
         end_timestamp: int | None,
         limit: int,
+        before_message_id: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses = ["group_id = ?"]
         parameters: list[object] = [group_id]
@@ -883,6 +893,16 @@ class MessageStore:
         if end_timestamp is not None:
             clauses.append("sent_at <= ?")
             parameters.append(end_timestamp)
+        if before_message_id:
+            if not self.message_exists(group_id, before_message_id):
+                raise ValueError("before_message_id 不属于当前群或已不存在")
+            clauses.append(
+                """(sent_at, id) < (
+                    SELECT sent_at, id FROM messages
+                    WHERE group_id = ? AND message_id = ?
+                )"""
+            )
+            parameters.extend([group_id, before_message_id])
         parameters.append(limit)
         with closing(self._connect()) as connection:
             rows = connection.execute(

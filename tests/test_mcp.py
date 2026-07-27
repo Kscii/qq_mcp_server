@@ -12,7 +12,7 @@ from mcp.shared.auth import OAuthClientInformationFull
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.mcp_server import _auth_provider, create_mcp_servers
-from qq_mcp_server.models import ChatMessage
+from qq_mcp_server.models import ROLEPLAY_GUIDANCE_MAX_LENGTH, ChatMessage
 from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.store import MessageStore
 
@@ -126,6 +126,7 @@ async def test_admin_and_group_apps_are_separate(config: AppConfig) -> None:
     }
     assert group_tools == {
         "trpg.get_status",
+        "trpg.open_campaign_dashboard",
         "trpg.get_roleplay_context",
         "trpg.get_character_card",
         "trpg.search_messages",
@@ -153,7 +154,7 @@ async def test_all_tool_and_parameter_descriptions_are_chinese(config: AppConfig
     )
 
     tools = [*(await admin.list_tools()), *(await group_mcp.list_tools())]
-    assert len(tools) == 20
+    assert len(tools) == 21
     for tool in tools:
         assert tool.description
         assert any("\u4e00" <= character <= "\u9fff" for character in tool.description)
@@ -162,6 +163,36 @@ async def test_all_tool_and_parameter_descriptions_are_chinese(config: AppConfig
                 f"{tool.name} 的参数 {parameter_name} 缺少面向 AI 的中文说明"
             )
             assert any("\u4e00" <= character <= "\u9fff" for character in schema["description"])
+
+    profile = next(tool for tool in tools if tool.name == "admin.update_group_profile")
+    guidance_schema = profile.parameters["properties"]["roleplay_guidance"]
+    string_schema = next(item for item in guidance_schema["anyOf"] if item.get("type") == "string")
+    assert string_schema["maxLength"] == ROLEPLAY_GUIDANCE_MAX_LENGTH
+
+
+async def test_campaign_dashboard_link_is_group_bound_and_available_while_disabled(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    _, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    async with Client(group_mcp) as client:
+        result = await client.call_tool("trpg.open_campaign_dashboard", {})
+
+    assert result.data["group"]["group_key"] == group["group_key"]
+    assert result.data["expires_in_seconds"] == 3600
+    assert result.data["read_only"] is True
+    token = str(result.data["url"]).rsplit("/", 1)[-1]
+    capability = store.capability(token, kind="campaign_dashboard")
+    assert capability["group_key"] == group["group_key"]
 
 
 async def test_disabled_group_reports_action_while_status_still_works(config: AppConfig) -> None:

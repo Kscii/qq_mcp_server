@@ -7,16 +7,17 @@
 | QQ 账号、OneBot 回环地址、数据库/卡片/规则路径、OAuth、公网地址、同步参数 | TOML/环境变量，部署时很少改 | 服务基础设施和秘密不能交给群聊决定 |
 | QQ 群加入/移出采集白名单 | 管理 MCP 签发的一次性网页 | 这是唯一需要人工确认群列表的配置 UI |
 | QQ 登录与 NapCat 恢复 | 管理 MCP 签发的一次性确认页 | 长期 Token 不进入 AI；重启还需要人工确认 |
-| 模组名、显示名、短角色偏好 | `admin.update_group_profile` | AI 可先读版本并可靠地结构化更新 |
+| 模组名、显示名、本群长期 RP 准则 | `admin.update_group_profile` | AI 可先读版本并可靠地结构化更新；准则最多 4096 字 |
 | 玩家、KP、骰娘 QQ 号 | `admin.list_group_members` 后调用 `admin.set_member_roles` | 绑定稳定 QQ 号，不绑定易变昵称 |
 | 跑团启用/停用 | `admin.set_group_enabled` | 只允许白名单群；停用不停止消息同步 |
 | 当前 Excel 人物卡 | 群 MCP 签发的一次性上传/预览/确认页 | MCP 发起且绑定当前群，Web 只承担文件选择器 |
 | HP/SAN/MP、技能、物品等动态值 | `trpg.commit_turn_updates` | 原子更新、来源消息、版本和撤销均可审计 |
 | 重要线索、人物、地点、目标等团务笔记 | 用户确认后 `trpg.commit_turn_updates` | 避免 AI 把模糊叙事写成事实 |
+| 查看当前群已保存的完整模组资料 | `trpg.open_campaign_dashboard` 签发的一小时只读页 | 固定绑定当前群，不增加 Web 编辑入口 |
 | 三本规则书 | 部署者执行 `build-rules` | PDF 私有、固定且不应出现在运行期 WebUI |
 
-WebUI 没有通用设置页、仪表盘或人物卡编辑器。它只呈现白名单按钮与一次性的文件上传
-确认。正常跑团和绝大多数配置都在 MCP 对话中完成。
+WebUI 没有通用设置页或人物卡编辑器。它只呈现白名单按钮、一次性的文件上传确认，以及
+群 MCP 签发的只读模组档案。正常跑团和全部资料修改仍在 MCP 对话中完成。
 
 ## 命令
 
@@ -102,7 +103,7 @@ v0.2 不迁移旧版 qq_mcp_server 或 Dice Echo 数据，也不迁移旧人物�
 - `admin.list_groups()`：群、固定 URL、版本、同步和下一步。
 - `admin.get_group_setup(group_key)`：单群完整准备清单。
 - `admin.list_group_members(group_key, query?, limit)`：读取稳定 QQ 号。
-- `admin.update_group_profile(group_key, expected_version, ...)`：模组/标签/短角色偏好。
+- `admin.update_group_profile(group_key, expected_version, ...)`：模组/标签/最多 4096 字的长期 RP 准则。
 - `admin.set_member_roles(group_key, expected_version, player, kp?, dice_bot?)`：成员角色。
 - `admin.set_group_enabled(group_key, expected_version, enabled)`：群级启停。
 
@@ -112,6 +113,7 @@ v0.2 不迁移旧版 qq_mcp_server 或 Dice Echo 数据，也不迁移旧人物�
 ## 群 MCP 工具
 
 - `trpg.get_status()`：即使停用也可用的准备与诊断。
+- `trpg.open_campaign_dashboard()`：签发绑定当前群、一小时有效且可重复浏览的只读档案页。
 - `trpg.get_roleplay_context(since_message_id?, limit)`：正常拟定回复的单次聚合读取。
 - `trpg.get_character_card(view="roleplay"|"full")`：当前卡和可选单元格来源。
 - `trpg.search_messages(query?, sender_qq_user_id?, after?, before?, limit)`：旧消息条件搜索。

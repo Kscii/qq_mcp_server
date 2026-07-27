@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+ROLEPLAY_GUIDANCE_MAX_LENGTH = 4096
+
 
 @dataclass(frozen=True, slots=True)
 class ChatMessage:

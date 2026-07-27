@@ -13,6 +13,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 
 from qq_mcp_server.cards import CharacterCardService, ParsedCard
 from qq_mcp_server.config import AppConfig
+from qq_mcp_server.dashboard import campaign_dashboard_response
 from qq_mcp_server.onebot import OneBotClient
 from qq_mcp_server.runtime import NapCatRuntime
 from qq_mcp_server.store import MessageStore
@@ -345,6 +346,21 @@ def register_web_routes(
         except Exception as error:
             return _error(error)
 
+    @mcp.custom_route("/dashboard/{token}", methods=["GET"], include_in_schema=False)
+    async def campaign_dashboard(request: Request) -> Response:
+        token = str(request.path_params["token"])
+        try:
+            capability = store.capability(token, kind="campaign_dashboard")
+            return campaign_dashboard_response(
+                request,
+                config=config,
+                store=store,
+                capability=capability,
+                token=token,
+            )
+        except Exception as error:
+            return _error(error)
+
     @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
     async def health(_: Request) -> Response:
         return Response("ok", media_type="text/plain")
@@ -367,6 +383,10 @@ def admin_page_url(config: AppConfig, token: str) -> str:
 
 def card_upload_url(config: AppConfig, token: str) -> str:
     return f"{_base_url(config)}/uploads/character-card/{token}"
+
+
+def campaign_dashboard_url(config: AppConfig, token: str) -> str:
+    return f"{_base_url(config)}/dashboard/{token}"
 
 
 def napcat_webui_url(config: AppConfig, token: str) -> str:

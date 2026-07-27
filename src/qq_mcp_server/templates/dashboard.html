@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ page_title }} · 模组档案</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f3f6fb;
+      --surface: #fff;
+      --surface-muted: #edf2f8;
+      --text: #172033;
+      --muted: #667085;
+      --line: #d7dfeb;
+      --accent: #315fc4;
+      --accent-soft: #e8efff;
+      --good: #18794e;
+      --warn: #b54708;
+      --bad: #b42318;
+      --shadow: 0 12px 30px rgb(35 55 90 / 8%);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1421;
+        --surface: #141d2c;
+        --surface-muted: #1b2638;
+        --text: #e7edf6;
+        --muted: #9ba9bd;
+        --line: #2a3950;
+        --accent: #86a9ff;
+        --accent-soft: #1c315e;
+        --good: #61d6a2;
+        --warn: #ffb86b;
+        --bad: #ff8c85;
+        --shadow: 0 12px 30px rgb(0 0 0 / 22%);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+        sans-serif;
+      line-height: 1.55;
+    }
+    a { color: var(--accent); }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .shell {
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 1.5rem 1rem;
+      border-right: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .brand {
+      margin: 0 .6rem 1.2rem;
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    nav { display: grid; gap: .35rem; }
+    nav a {
+      padding: .68rem .8rem;
+      border-radius: .65rem;
+      color: var(--muted);
+      text-decoration: none;
+      font-weight: 650;
+    }
+    nav a:hover, nav a.active { background: var(--accent-soft); color: var(--accent); }
+    main { min-width: 0; padding: 2rem clamp(1rem, 3vw, 3rem) 4rem; }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    h1 { margin: 0; font-size: clamp(1.55rem, 3vw, 2.25rem); }
+    h2 { margin: 0 0 .8rem; font-size: 1.12rem; }
+    h3 { margin: 0 0 .55rem; font-size: 1rem; }
+    p { margin: .35rem 0; }
+    .subtitle { color: var(--muted); margin-top: .3rem; }
+    .button, button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 0;
+      border-radius: .6rem;
+      padding: .62rem .9rem;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .button.secondary { background: var(--surface-muted); color: var(--text); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    .card {
+      min-width: 0;
+      padding: 1rem 1.1rem;
+      border: 1px solid var(--line);
+      border-radius: .85rem;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .metric { font-size: 1.65rem; font-weight: 800; }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .badge {
+      display: inline-block;
+      margin: .15rem .25rem .15rem 0;
+      padding: .18rem .48rem;
+      border-radius: 999px;
+      background: var(--surface-muted);
+      color: var(--muted);
+      font-size: .78rem;
+      font-weight: 700;
+    }
+    dl { margin: 0; }
+    .facts {
+      display: grid;
+      grid-template-columns: minmax(8rem, .7fr) minmax(0, 1.8fr);
+      gap: .55rem 1rem;
+    }
+    dt { color: var(--muted); }
+    dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: .65rem .55rem; border-bottom: 1px solid var(--line); text-align: left; }
+    th { color: var(--muted); font-size: .82rem; }
+    .table-wrap { overflow-x: auto; }
+    .guidance, .message-text, pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .guidance { font-size: 1rem; line-height: 1.78; }
+    pre {
+      max-height: 38rem;
+      overflow: auto;
+      padding: .9rem;
+      border-radius: .65rem;
+      background: var(--surface-muted);
+      font-size: .82rem;
+    }
+    details { margin: .75rem 0; }
+    details > summary { cursor: pointer; font-weight: 750; }
+    .tree, .tree ul { margin: .45rem 0; padding-left: 1.15rem; }
+    .tree li { margin: .3rem 0; }
+    .filters {
+      display: grid;
+      grid-template-columns: minmax(12rem, 2fr) minmax(9rem, 1fr) repeat(2, minmax(10rem, 1fr));
+      gap: .65rem;
+      align-items: end;
+    }
+    label { display: grid; gap: .25rem; color: var(--muted); font-size: .82rem; }
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: .55rem;
+      padding: .58rem .65rem;
+      background: var(--surface);
+      color: var(--text);
+      font: inherit;
+    }
+    .message { margin: .8rem 0; }
+    .message-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .35rem .65rem;
+      align-items: baseline;
+      margin-bottom: .4rem;
+    }
+    .message-id { color: var(--muted); font-size: .75rem; overflow-wrap: anywhere; }
+    .pager { display: flex; gap: .65rem; margin-top: 1rem; }
+    .empty { padding: 2.5rem 1rem; text-align: center; color: var(--muted); }
+    @media (max-width: 820px) {
+      .shell { display: block; }
+      aside {
+        position: static;
+        height: auto;
+        padding: .75rem;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        overflow-x: auto;
+      }
+      .brand { margin: 0 .4rem .55rem; }
+      nav { display: flex; width: max-content; }
+      nav a { white-space: nowrap; }
+      main { padding-top: 1.25rem; }
+      .filters { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 520px) {
+      .topbar { display: block; }
+      .topbar .button { margin-top: .8rem; }
+      .filters, .facts { grid-template-columns: 1fr; }
+      th, td { padding: .55rem .4rem; }
+    }
+  </style>
+</head>
+<body>
+  {% macro render_tree(value) -%}
+    {% if value is mapping %}
+      <ul class="tree">
+      {% for key, child in value.items() %}
+        <li><strong>{{ key }}</strong>{{ render_tree(child) }}</li>
+      {% endfor %}
+      </ul>
+    {% elif value is sequence and value is not string %}
+      {% if value %}
+        <ol class="tree">
+        {% for child in value %}<li>{{ render_tree(child) }}</li>{% endfor %}
+        </ol>
+      {% else %}
+        <span class="muted"> 空</span>
+      {% endif %}
+    {% else %}
+      <span>：{{ value if value is not none else "未填写" }}</span>
+    {% endif %}
+  {%- endmacro %}
+  <div class="shell">
+    <aside>
+      <p class="brand">COC Campaign Archive</p>
+      <nav aria-label="模组档案">
+        {% for key, label in sections %}
+          <a href="?section={{ key }}" class="{{ 'active' if section == key else '' }}">{{ label }}</a>
+        {% endfor %}
+      </nav>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div>
+          <h1>{{ page_title }}</h1>
+          <p class="subtitle">{{ group.qq_group_name }} · {{ group.qq_group_id }}
+            {% if character_name %}· {{ character_name }}{% endif %}
+          </p>
+        </div>
+        <a class="button secondary" href="{{ refresh_url }}">刷新当前页面</a>
+      </header>
+
+      {% if section == "overview" %}
+        <div class="grid">
+          <section class="card">
+            <h2>运行状态</h2>
+            <p class="metric {{ 'good' if group.roleplay_enabled else 'warn' }}">
+              {{ "跑团已启用" if group.roleplay_enabled else "跑团已停用" }}
+            </p>
+            <p class="muted">群版本 {{ group.version }}</p>
+          </section>
+          <section class="card">
+            <h2>消息同步</h2>
+            <p class="metric {{ 'good' if freshness.fresh else 'bad' }}">
+              {{ "新鲜" if freshness.fresh else "需要检查" }}
+            </p>
+            <p class="muted">
+              {% if freshness.age_seconds is not none %}{{ freshness.age_seconds }} 秒前{% else %}尚无同步时间{% endif %}
+            </p>
+          </section>
+          <section class="card">
+            <h2>已保存消息</h2>
+            <p class="metric">{{ sync.message_count }}</p>
+            <p class="muted">{{ "历史回填完成" if sync.initial_import_complete else "历史仍在回填" }}</p>
+          </section>
+        </div>
+        <div class="grid">
+          <section class="card">
+            <h2>模组信息</h2>
+            <dl class="facts">
+              <dt>模组标题</dt><dd>{{ group.module_title or "未设置" }}</dd>
+              <dt>显示标签</dt><dd>{{ group.display_label or "未设置" }}</dd>
+              <dt>当前人物</dt><dd>{{ character_name or "尚未上传人物卡" }}</dd>
+              <dt>最近同步</dt><dd>{{ sync.last_sync_at_display or "尚无" }}</dd>
+              <dt>消息时间范围</dt>
+              <dd>{{ sync.oldest_time_display or "尚无" }} — {{ sync.newest_time_display or "尚无" }}</dd>
+              <dt>同步错误</dt><dd class="{{ 'bad' if sync.last_error else '' }}">{{ sync.last_error or "无" }}</dd>
+            </dl>
+          </section>
+          <section class="card">
+            <h2>成员角色</h2>
+            {% if roles %}
+              <div class="table-wrap"><table>
+                <thead><tr><th>角色</th><th>显示名</th><th>QQ</th></tr></thead>
+                <tbody>
+                  {% for row in roles %}
+                    <tr><td>{{ row.role }}</td><td>{{ row.display_name }}</td><td>{{ row.user_id }}</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table></div>
+            {% else %}
+              <p class="empty">尚未绑定玩家、KP 或骰娘</p>
+            {% endif %}
+          </section>
+        </div>
+        <section class="card">
+          <h2>人物卡来源</h2>
+          {% if character_source %}
+            <dl class="facts">
+              <dt>文件名</dt><dd>{{ character_source.filename }}</dd>
+              <dt>导入时间</dt><dd>{{ character_source.imported_at }}</dd>
+              <dt>SHA-256</dt><dd><code>{{ character_source.sha256 }}</code></dd>
+            </dl>
+          {% else %}
+            <p class="empty">尚未上传人物卡</p>
+          {% endif %}
+        </section>
+
+      {% elif section == "guidance" %}
+        <section class="card">
+          <h2>本群长期 RP 准则</h2>
+          <p class="muted">{{ guidance_length }} / {{ guidance_limit }} 字 · 只读</p>
+          {% if roleplay_guidance %}
+            <div class="guidance">{{ roleplay_guidance }}</div>
+          {% else %}
+            <p class="empty">尚未设置 RP 准则</p>
+          {% endif %}
+        </section>
+
+      {% elif section == "card" %}
+        {% if character %}
+          <div class="grid">
+            <section class="card">
+              <h2>来源</h2>
+              <dl class="facts">
+                <dt>文件名</dt><dd>{{ character.source_filename }}</dd>
+                <dt>导入时间</dt><dd>{{ character.imported_at }}</dd>
+                <dt>SHA-256</dt><dd><code>{{ character.source_sha256 }}</code></dd>
+              </dl>
+            </section>
+            <section class="card">
+              <h2>动态变化</h2>
+              <p class="metric">{{ character.differences|length }}</p>
+              <p class="muted">相对最近一次上传的基础卡</p>
+            </section>
+          </div>
+          {% if character.differences %}
+            <section class="card">
+              <h2>基础卡与当前卡差异</h2>
+              <div class="table-wrap"><table>
+                <thead><tr><th>字段</th><th>基础值</th><th>当前值</th></tr></thead>
+                <tbody>
+                {% for diff in character.differences %}
+                  <tr><td><code>{{ diff.path }}</code></td><td><pre>{{ diff.before }}</pre></td><td><pre>{{ diff.after }}</pre></td></tr>
+                {% endfor %}
+                </tbody>
+              </table></div>
+            </section>
+          {% endif %}
+          <section class="card">
+            <h2>当前人物卡</h2>
+            {% for item in character.sections %}
+              <details {{ "open" if item.key in ("identity", "vitals") else "" }}>
+                <summary>{{ item.label }}</summary>
+                {{ render_tree(item.value) }}
+              </details>
+            {% endfor %}
+            <details>
+              <summary>完整结构</summary>
+              <pre>{{ character.full_json }}</pre>
+            </details>
+          </section>
+        {% else %}
+          <section class="card"><p class="empty">尚未上传人物卡</p></section>
+        {% endif %}
+
+      {% elif section == "notes" %}
+        {% if notes %}
+          <div class="grid">
+          {% for note in notes %}
+            <article class="card">
+              <h2>{{ note.title }}</h2>
+              <p>
+                <span class="badge">{{ note.category_label }}</span>
+                <span class="badge">{{ "有效" if note.status == "active" else "已解决" }}</span>
+              </p>
+              <div class="guidance">{{ note.content }}</div>
+              <p class="muted">更新于 {{ note.updated_at_display }} · ID {{ note.note_id }}</p>
+              {% if note.source_message_ids %}
+                <p class="message-id">来源消息：{{ note.source_message_ids|join(", ") }}</p>
+              {% endif %}
+            </article>
+          {% endfor %}
+          </div>
+        {% else %}
+          <section class="card"><p class="empty">尚无团务笔记</p></section>
+        {% endif %}
+
+      {% elif section == "messages" %}
+        <section class="card">
+          <h2>检索已入库群消息</h2>
+          <form class="filters" method="get">
+            <input type="hidden" name="section" value="messages">
+            <label>文本
+              <input name="query" maxlength="200" value="{{ message_filters.query }}" placeholder="消息片段">
+            </label>
+            <label>发送者 QQ
+              <input name="sender" inputmode="numeric" value="{{ message_filters.sender }}" placeholder="稳定 QQ 号">
+            </label>
+            <label>起始时间
+              <input type="datetime-local" name="after" value="{{ message_filters.after }}">
+            </label>
+            <label>结束时间
+              <input type="datetime-local" name="before" value="{{ message_filters.before }}">
+            </label>
+            <button type="submit">检索</button>
+            <a class="button secondary" href="?section=messages">清除条件</a>
+          </form>
+        </section>
+        {% if messages %}
+          {% for message in messages %}
+            <article class="card message">
+              <div class="message-head">
+                <strong>{{ message.sender_display }}</strong>
+                <span class="badge">{{ message.sender_role_label }}</span>
+                <span class="muted">{{ message.sent_at_display }}</span>
+                <span class="muted">QQ {{ message.sender_id }}</span>
+              </div>
+              <div class="message-text">{{ message.plain_text or "（无可读文字）" }}</div>
+              {% if message.reply_to_message_id %}
+                <p class="message-id">回复消息 {{ message.reply_to_message_id }}</p>
+              {% endif %}
+              {% if message.contains_unsupported_media %}
+                <p class="warn">包含未解析媒体；服务器未保存媒体 URL</p>
+              {% endif %}
+              <p class="message-id">消息 ID：{{ message.message_id }}</p>
+            </article>
+          {% endfor %}
+        {% else %}
+          <section class="card"><p class="empty">{{ "没有符合条件的消息" if messages_filtered else "尚无已入库消息" }}</p></section>
+        {% endif %}
+        <div class="pager">
+          {% if older_messages_url %}<a class="button secondary" href="{{ older_messages_url }}">查看更早消息</a>{% endif %}
+          <a class="button secondary" href="?section=messages">返回最新消息</a>
+        </div>
+
+      {% elif section == "changes" %}
+        {% if changes %}
+          {% for change in changes %}
+            <article class="card message">
+              <div class="message-head">
+                <strong>{{ change.summary }}</strong>
+                <span class="badge">{{ change.origin }}</span>
+                <span class="badge">{{ "已撤销" if change.undone else "有效" }}</span>
+                <span class="muted">{{ change.created_at_display }}</span>
+              </div>
+              <p class="muted">版本 {{ change.base_version }} → {{ change.new_version }} · {{ change.change_id }}</p>
+              {% if change.undone_by %}
+                <p class="muted">由 {{ change.undone_by }} 撤销</p>
+              {% endif %}
+              <details>
+                <summary>操作明细</summary>
+                <pre>{{ change.operations_json }}</pre>
+              </details>
+            </article>
+          {% endfor %}
+        {% else %}
+          <section class="card"><p class="empty">尚无变更记录</p></section>
+        {% endif %}
+        {% if older_changes_url %}
+          <div class="pager"><a class="button secondary" href="{{ older_changes_url }}">查看更早变更</a></div>
+        {% endif %}
+      {% endif %}
+    </main>
+  </div>
+</body>
+</html>

@@ -20,9 +20,10 @@
               ▼                           ▼
       /mcp/admin                 /mcp/groups/{group_key}
        跨群管理 App                 永久绑定一个白名单群
-              │
-       一次性最小 Web 页面
-       白名单 / XLSX / NapCat 登录与恢复确认
+              │                           │
+       一次性最小 Web 页面          一小时只读模组档案
+       白名单 / XLSX / NapCat       准则 / 卡 / 笔记 / 消息 / 变更
+       登录与恢复确认
 ```
 
 ## 隔离模型
@@ -41,7 +42,8 @@ ChatGPT 对话只连接该群的 MCP 地址。这比每次工具调用传群名�
 模型误选群。
 
 移出白名单会停止同步并令群端点失效。停用 `roleplay_enabled` 只锁定跑团读写工具，
-`trpg.get_status` 仍可诊断，而且白名单消息继续同步。
+`trpg.get_status` 仍可诊断，`trpg.open_campaign_dashboard` 仍可查看已保存资料，而且
+白名单消息继续同步。
 
 ## 同步与消息边界
 
@@ -94,6 +96,7 @@ PDF 上传或服务器端 LLM。
 - `rules.py`：三本 PDF 的离线构建与运行期只读检索。
 - `mcp_server.py`：管理/群 MCP 工具、OAuth 和群路径隔离。
 - `web.py`：白名单、人物卡、NapCat 私有跳转和恢复确认的能力链接页面。
+- `dashboard.py`：群绑定只读档案的数据整形、分页、时间转换和 Jinja2 渲染。
 - `ai_instructions.py`：内置工具选择、安全、符号和三候选跑团规则。
 - `cli.py`：配置、同步、运行、状态、规则构建和 NapCat 安全配置。
 

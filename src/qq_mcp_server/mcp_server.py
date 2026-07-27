@@ -46,13 +46,14 @@ from qq_mcp_server import __version__
 from qq_mcp_server.ai_instructions import ADMIN_INSTRUCTIONS, GROUP_INSTRUCTIONS, PROMPT_VERSION
 from qq_mcp_server.cards import CharacterCardService, roleplay_view
 from qq_mcp_server.config import AppConfig, ConfigError
-from qq_mcp_server.models import CardOperation, NoteOperation
+from qq_mcp_server.models import ROLEPLAY_GUIDANCE_MAX_LENGTH, CardOperation, NoteOperation
 from qq_mcp_server.onebot import OneBotClient
 from qq_mcp_server.rules import RuleIndex
 from qq_mcp_server.runtime import NapCatRuntime, sync_freshness
 from qq_mcp_server.store import MessageStore, VersionConflictError
 from qq_mcp_server.web import (
     admin_page_url,
+    campaign_dashboard_url,
     card_upload_url,
     napcat_recovery_url,
     napcat_webui_url,
@@ -81,6 +82,13 @@ _DESTRUCTIVE = {
     "idempotentHint": False,
     "openWorldHint": False,
 }
+_READ_LINK = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": False,
+}
+_DASHBOARD_TOKEN_TTL_SECONDS = 3600
 _OAUTH_STORAGE_SCHEMA = "v2"
 _RESOURCE_BINDINGS_COLLECTION = "qq-mcp-resource-bindings-v1"
 
@@ -789,7 +797,7 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.update_group_profile",
         description=(
-            "仅在用户直接要求后，用于设置长期保存的模组标题、群显示标签或简短的本群扮演风格偏好。"
+            "仅在用户直接要求后，用于设置长期保存的模组标题、群显示标签或本群长期 RP 准则。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -805,7 +813,13 @@ def create_mcp_servers(
             str | None, Field(description="可选的群显示标签；省略则保持不变。")
         ] = None,
         roleplay_guidance: Annotated[
-            str | None, Field(description="可选的本群简短扮演风格偏好；省略则保持不变。")
+            str | None,
+            Field(
+                description=(
+                    "可选的本群长期 RP 准则；最多 4096 字，空字符串表示清除，省略则保持不变。"
+                ),
+                max_length=ROLEPLAY_GUIDANCE_MAX_LENGTH,
+            ),
         ] = None,
     ) -> dict[str, Any]:
         try:
@@ -944,6 +958,32 @@ def create_mcp_servers(
             "version": group["version"],
             **_readiness(store, rules, group),
             "sync_freshness": sync_freshness(sync, config.context_freshness_seconds),
+        }
+
+    @group_mcp.tool(
+        name="trpg.open_campaign_dashboard",
+        description=(
+            "用户需要在浏览器查看本固定群已保存的模组、RP 准则、人物卡、笔记、"
+            "群消息或变更记录时调用。返回一小时有效的只读网页链接。"
+        ),
+        annotations=_READ_LINK,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def open_campaign_dashboard() -> dict[str, Any]:
+        group = selected_group()
+        token = store.issue_capability(
+            kind="campaign_dashboard",
+            group_key=str(group["group_key"]),
+            issued_to=_request_email(),
+            ttl_seconds=_DASHBOARD_TOKEN_TTL_SECONDS,
+        )
+        return {
+            "group": _group_meta(group),
+            "url": campaign_dashboard_url(config, token),
+            "expires_in_seconds": _DASHBOARD_TOKEN_TTL_SECONDS,
+            "read_only": True,
+            "sections": ["overview", "guidance", "card", "notes", "messages", "changes"],
         }
 
     @group_mcp.tool(
