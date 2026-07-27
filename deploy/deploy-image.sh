@@ -13,8 +13,20 @@ esac
 
 cd "$(dirname "$0")"
 old_image=""
+old_collector_image=""
 if [ -f deploy.env ]; then
     old_image="$(sed -n 's/^APP_IMAGE=//p' deploy.env | head -n 1)"
+    old_collector_image="$(sed -n 's/^COLLECTOR_IMAGE=//p' deploy.env | head -n 1)"
+fi
+deploy_collector="${DEPLOY_COLLECTOR:-0}"
+case "$deploy_collector" in
+    0|1) ;;
+    *) echo "DEPLOY_COLLECTOR 只能是 0 或 1" >&2; exit 2 ;;
+esac
+if [ "$deploy_collector" = "1" ] || [ -z "$old_collector_image" ]; then
+    collector_image="$1"
+else
+    collector_image="$old_collector_image"
 fi
 data_dir="$(sed -n 's/^DATA_DIR=//p' .env | tail -n 1)"
 [ -n "$data_dir" ] || data_dir="/var/lib/qq_mcp_server"
@@ -25,7 +37,7 @@ case "$database_container_path" in
     *) echo "DATABASE_PATH 必须位于 /data 持久卷内" >&2; exit 2 ;;
 esac
 migration_marker="$data_dir/control/pre-v4-backup.path"
-printf 'APP_IMAGE=%s\n' "$1" > deploy.env
+printf 'APP_IMAGE=%s\nCOLLECTOR_IMAGE=%s\n' "$1" "$collector_image" > deploy.env
 chmod 600 deploy.env
 
 if ./deploy.sh; then
@@ -80,8 +92,16 @@ os.replace(temporary_path, destination_path)
 ' "$backup_path" "$database_path"
     fi
     echo "恢复上一镜像。" >&2
-    printf 'APP_IMAGE=%s\n' "$old_image" > deploy.env
+    if [ -n "$old_collector_image" ]; then
+        rollback_collector_image="$old_collector_image"
+    else
+        rollback_collector_image="$collector_image"
+        docker compose --env-file .env --env-file deploy.env stop collector \
+            >/dev/null 2>&1 || true
+    fi
+    printf 'APP_IMAGE=%s\nCOLLECTOR_IMAGE=%s\n' \
+        "$old_image" "$rollback_collector_image" > deploy.env
     chmod 600 deploy.env
-    SKIP_SAFETY_MIGRATION=1 ./deploy.sh
+    DEPLOY_COLLECTOR=0 SKIP_SAFETY_MIGRATION=1 ./deploy.sh
 fi
 exit 1

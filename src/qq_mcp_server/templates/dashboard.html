@@ -264,7 +264,7 @@
             <p class="muted">群版本 {{ group.version }}</p>
           </section>
           <section class="card">
-            <h2>SSE 实时采集</h2>
+            <h2>QQ 实时采集</h2>
             <p class="metric {{ 'good' if sse.healthy else 'bad' }}">
               {{ "连接健康" if sse.healthy else "需要检查" }}
             </p>
@@ -287,7 +287,9 @@
               <dt>模组标题</dt><dd>{{ group.module_title or "未设置" }}</dd>
               <dt>显示标签</dt><dd>{{ group.display_label or "未设置" }}</dd>
               <dt>当前人物</dt><dd>{{ character_name or "尚未上传人物卡" }}</dd>
-              <dt>SSE 状态</dt><dd>{{ "已连接" if sse.connected else "未连接" }}</dd>
+              <dt>事件链路</dt><dd>{{ "已连接" if sse.connected else "未连接" }}</dd>
+              <dt>QQ 在线</dt><dd>{{ "在线" if sse.qq_online else "离线或待确认" }}</dd>
+              <dt>恢复状态</dt><dd>{{ sse.recovery_state or "未知" }}</dd>
               <dt>消息时间范围</dt>
               <dd>{{ message_state.oldest_time_display or "尚无" }} — {{ message_state.newest_time_display or "尚无" }}</dd>
               <dt>采集错误</dt><dd class="{{ 'bad' if sse.last_error else '' }}">{{ sse.last_error or "无" }}</dd>

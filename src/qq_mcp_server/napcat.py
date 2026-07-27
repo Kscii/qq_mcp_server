@@ -16,7 +16,7 @@ def _atomic_json(path: Path, value: object) -> None:
 
 
 def prepare_napcat_config(directory: Path, onebot_token: str, account_id: str) -> None:
-    """生成仅监听回环地址的只读 HTTP 与 HTTP-SSE NapCat 配置。"""
+    """生成回环只读 HTTP 与反向 WebSocket 事件配置。"""
     if not onebot_token:
         raise ValueError("ONEBOT_ACCESS_TOKEN 不能为空")
     if not account_id.isdigit():
@@ -79,23 +79,22 @@ def _onebot_config(token: str) -> dict[str, Any]:
                     "debug": False,
                 }
             ],
-            "httpSseServers": [
+            "httpSseServers": [],
+            "httpClients": [],
+            "websocketServers": [],
+            "websocketClients": [
                 {
                     "enable": True,
                     "name": "qq_mcp_server_events",
-                    "host": "127.0.0.1",
-                    "port": 3001,
-                    "enableCors": False,
-                    "enableWebsocket": False,
+                    "url": "ws://127.0.0.1:3001/onebot/v11/ws",
                     "messagePostFormat": "array",
+                    "reportSelfMessage": True,
+                    "reconnectInterval": 5000,
                     "token": token,
                     "debug": False,
-                    "reportSelfMessage": True,
+                    "heartInterval": 30000,
                 }
             ],
-            "httpClients": [],
-            "websocketServers": [],
-            "websocketClients": [],
             "plugins": [],
         },
         "musicSignUrl": "",

@@ -5,7 +5,7 @@ services:
     image: docker.io/mlikiowa/napcat-docker@sha256:11d72e50b6edc01b20f1a7611a250720e61412fe96184e3c70c3b8cf976744e1
     container_name: qq-mcp-server-napcat
     network_mode: host
-    restart: "on-failure:2"
+    restart: "no"
     init: true
     environment:
       ACCOUNT: ${QQ_ACCOUNT_ID:?请在 .env 设置 QQ_ACCOUNT_ID}
@@ -29,9 +29,9 @@ services:
     user: "${HOST_UID:-1001}:${HOST_GID:-1002}"
     env_file:
       - .env
+    environment:
+      QQ_MCP_API_ONLY: "1"
     command: ["-c", "/config/config.toml", "run"]
-    depends_on:
-      - napcat
     read_only: true
     cap_drop: ["ALL"]
     security_opt:
@@ -47,6 +47,37 @@ services:
       timeout: 10s
       retries: 3
       start_period: 90s
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  collector:
+    image: ${COLLECTOR_IMAGE:?请通过 deploy.env 设置 COLLECTOR_IMAGE}
+    container_name: qq-mcp-server-collector
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    user: "${HOST_UID:-1001}:${HOST_GID:-1002}"
+    env_file:
+      - .env
+    command: ["-c", "/config/config.toml", "run-collector"]
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ./config.server.toml:/config/config.toml:ro
+      - ${DATA_DIR:-/var/lib/qq_mcp_server}:/data
+    healthcheck:
+      test: ["CMD", "qq_mcp_server", "-c", "/config/config.toml", "status", "--json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     logging:
       driver: local
       options:

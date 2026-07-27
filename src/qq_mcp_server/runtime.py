@@ -16,6 +16,7 @@ from qq_mcp_server.onebot import (
     OneBotClient,
     OneBotConfigurationError,
     OneBotSessionError,
+    OneBotTransportError,
     onebot_action_source,
 )
 from qq_mcp_server.store import MessageStore
@@ -23,9 +24,15 @@ from qq_mcp_server.sync import (
     AccountMismatchError,
     CollectionPausedError,
     MultiGroupSyncManager,
+    SyncService,
 )
 
 LOGGER = logging.getLogger(__name__)
+STATUS_CHECK_INTERVAL_SECONDS = 60
+RECOVERY_QUIET_SECONDS = 300
+EXPLICIT_HISTORY_COOLDOWN_SECONDS = 600
+REGISTRY_COOLDOWN_SECONDS = 3600
+MEMBER_LIST_COOLDOWN_SECONDS = 3600
 
 
 def _utc_now() -> datetime:
@@ -65,7 +72,7 @@ def sync_freshness(state: dict[str, Any], maximum_age_seconds: float) -> dict[st
 
 
 class NapCatRuntime:
-    """群发现、SSE 实时导入和面向管理 MCP 的诊断状态。"""
+    """群发现、被动事件导入、会话熔断和面向 MCP 的诊断状态。"""
 
     def __init__(
         self,
@@ -76,6 +83,7 @@ class NapCatRuntime:
         manager: MultiGroupSyncManager | None = None,
         *,
         sse_transport: httpx.AsyncBaseTransport | None = None,
+        collector_owner: bool = False,
     ) -> None:
         self.config = config
         self.client = client
@@ -86,7 +94,7 @@ class NapCatRuntime:
         self._registry_lock = asyncio.Lock()
         self._session_id: str | None = None
         self.store.ensure_active_qq_account(config.account_id)
-        abandoned = self.store.close_abandoned_collector_session()
+        abandoned = self.store.close_abandoned_collector_session() if collector_owner else None
         if abandoned is not None:
             heartbeat_at = abandoned.get("last_heartbeat_at") or abandoned.get("connected_at")
             try:
@@ -99,6 +107,67 @@ class NapCatRuntime:
                 source="unclean_restart",
             )
 
+    def _transport_status(self) -> dict[str, Any]:
+        status = self.store.runtime_status("event_transport")
+        if status.get("updated_at") is not None:
+            return status
+        return self.store.runtime_status("sse")
+
+    def _set_transport_status(self, value: dict[str, Any]) -> None:
+        # 保留 sse 兼容键，避免升级瞬间让旧客户端和只读仪表盘失去状态。
+        self.store.set_runtime_status("event_transport", value)
+        self.store.set_runtime_status("sse", value)
+
+    def health_snapshot(self) -> dict[str, Any]:
+        transport = self._transport_status()
+        session = self.store.runtime_status("session_health")
+        control = self.manager.control_status()
+        interval_ms = int(transport.get("heartbeat_interval_ms") or 30_000)
+        timeout_seconds = max(60.0, interval_ms * 3 / 1000)
+        event_age = _age_seconds(
+            transport.get("last_heartbeat_at") or transport.get("last_event_at")
+        )
+        event_fresh = bool(
+            transport.get("connected")
+            and (
+                (event_age is not None and event_age <= timeout_seconds)
+                or (event_age is None and transport.get("transport") != "reverse_websocket")
+            )
+        )
+        qq_online = session.get("qq_online")
+        if not isinstance(qq_online, bool):
+            candidate = transport.get("online")
+            qq_online = candidate if isinstance(candidate, bool) else False
+        safe = bool(
+            control.get("status") == "active"
+            and session.get("recovery_state") in {None, "active"}
+            and qq_online
+            and event_fresh
+        )
+        return {
+            "qq_online": qq_online,
+            "onebot_reachable": bool(
+                session.get("onebot_reachable")
+                if session.get("updated_at") is not None
+                else transport.get("connected")
+            ),
+            "event_connected": bool(transport.get("connected")),
+            "data_fresh": bool(qq_online and event_fresh),
+            "safe_to_roleplay": safe,
+            "last_event_at": transport.get("last_event_at"),
+            "last_heartbeat_at": transport.get("last_heartbeat_at"),
+            "event_age_seconds": round(event_age, 3) if event_age is not None else None,
+            "event_timeout_seconds": timeout_seconds,
+            "offline_since": session.get("offline_since"),
+            "online_since": session.get("online_since"),
+            "recovery_state": session.get("recovery_state") or ("active" if safe else "unknown"),
+            "offline_reason": session.get("offline_reason"),
+            "last_status_check_at": session.get("last_status_check_at"),
+            "consecutive_online_checks": int(session.get("consecutive_online_checks") or 0),
+            "collection_control": control,
+            "event_transport": transport,
+        }
+
     async def refresh_registry(self, *, force: bool = False) -> list[dict[str, Any]]:
         self.manager.require_active()
         async with self._registry_lock:
@@ -109,10 +178,11 @@ class NapCatRuntime:
                     try:
                         age = (_utc_now() - datetime.fromisoformat(last_attempt)).total_seconds()
                     except ValueError:
-                        age = 60
-                    if age < 60:
+                        age = REGISTRY_COOLDOWN_SECONDS
+                    if age < REGISTRY_COOLDOWN_SECONDS:
                         raise RuntimeError(
-                            f"群列表强制刷新冷却中，请等待 {max(1, int(60 - age))} 秒"
+                            "群列表强制刷新冷却中，请等待 "
+                            f"{max(1, int(REGISTRY_COOLDOWN_SECONDS - age))} 秒"
                         )
             attempt_at = _iso_now()
             try:
@@ -296,7 +366,8 @@ class NapCatRuntime:
 
     async def get_status(self) -> dict[str, Any]:
         registry = self.store.runtime_status("group_registry")
-        sse = self.store.runtime_status("sse")
+        health = self.health_snapshot()
+        transport = health["event_transport"]
         control = self.manager.control_status()
         unresolved_gaps = self.store.list_message_gaps(unresolved_only=True)
         group_status: list[dict[str, Any]] = []
@@ -322,10 +393,18 @@ class NapCatRuntime:
             status = "collection_paused"
         elif control.get("status") == "paused_configuration":
             status = "configuration_error"
-        elif not sse.get("connected"):
-            status = "onebot_unreachable" if sse.get("last_error") else "sse_connecting"
-        elif sse.get("online") is False or sse.get("good") is False:
+        elif health["onebot_reachable"] is False:
+            status = (
+                "onebot_unreachable"
+                if health.get("last_status_check_at") or transport.get("last_error")
+                else "status_check_pending"
+            )
+        elif health["qq_online"] is False:
             status = "login_required"
+        elif not health["event_connected"]:
+            status = "event_connecting"
+        elif not health["data_fresh"]:
+            status = "event_stale"
         elif unresolved_gaps:
             status = "data_gap_warning"
         else:
@@ -368,10 +447,15 @@ class NapCatRuntime:
             "status": status,
             "expected_account_id": self.config.account_id,
             "current_account_id": (self.store.active_qq_account() or {}).get("account_id"),
-            "onebot_reachable": bool(sse.get("connected")),
+            **{
+                key: value
+                for key, value in health.items()
+                if key not in {"collection_control", "event_transport"}
+            },
             "collection_control": control,
             "group_registry": registry,
-            "sse": sse,
+            "event_transport": transport,
+            "sse": transport,
             "collector_session": self.store.active_collector_session(),
             "accounts": self.store.list_qq_accounts(),
             "latest_account_switch": self.store.latest_qq_account_switch(),
@@ -389,21 +473,21 @@ class NapCatRuntime:
         )
 
     def _mark_stream_healthy(self, *, event_at: int | None = None) -> None:
+        if not self.manager.is_active():
+            return
         self.store.close_open_message_gaps(
             end_at=event_at or int(_utc_now().timestamp()),
             automatic_only=True,
         )
 
     async def handle_event(self, event: dict[str, Any]) -> None:
-        if not self.manager.is_active():
+        if not self.manager.allows_passive_events():
             return
         self_id = str(event.get("self_id") or "")
         if self_id and self_id != self.config.account_id:
             self.manager.pause_session(
-                AccountMismatchError(
-                    f"SSE 事件来自 QQ {self_id}，配置要求 {self.config.account_id}"
-                ),
-                source="sse_event",
+                AccountMismatchError(f"事件来自 QQ {self_id}，配置要求 {self.config.account_id}"),
+                source="event_transport",
             )
             return
         post_type = str(event.get("post_type") or "")
@@ -425,9 +509,8 @@ class NapCatRuntime:
                             online=online if isinstance(online, bool) else None,
                             good=good if isinstance(good, bool) else None,
                         )
-                current = self.store.runtime_status("sse")
-                self.store.set_runtime_status(
-                    "sse",
+                current = self._transport_status()
+                self._set_transport_status(
                     {
                         **{key: value for key, value in current.items() if key != "updated_at"},
                         "connected": True,
@@ -444,6 +527,30 @@ class NapCatRuntime:
                         source="heartbeat_degraded",
                         confidence="confirmed",
                         start_at=event_at,
+                    )
+                    if self.manager.is_active():
+                        self.manager.pause_session(
+                            OneBotSessionError("NapCat 心跳报告 QQ 已离线"),
+                            source="event_heartbeat",
+                        )
+                    current_health = self.store.runtime_status("session_health")
+                    self.store.set_runtime_status(
+                        "session_health",
+                        {
+                            **{
+                                key: value
+                                for key, value in current_health.items()
+                                if key != "updated_at"
+                            },
+                            "qq_online": False,
+                            "onebot_reachable": True,
+                            "offline_since": current_health.get("offline_since") or _iso_now(),
+                            "online_since": None,
+                            "consecutive_online_checks": 0,
+                            "recovery_state": "offline",
+                            "offline_reason": "NapCat 心跳报告 QQ 已离线",
+                            "last_status_check_at": current_health.get("last_status_check_at"),
+                        },
                     )
                 else:
                     self._mark_stream_healthy(event_at=event_at)
@@ -495,6 +602,73 @@ class NapCatRuntime:
             self._session_id = None
         if open_gap:
             self._open_outage(source="sse_disconnect", confidence=confidence)
+
+    def begin_event_session(self) -> str:
+        if self._session_id is not None:
+            self.end_event_session(
+                reason="replaced_by_new_connection",
+                open_gap=False,
+            )
+        self._begin_sse_session()
+        previous = self._transport_status()
+        self._set_transport_status(
+            {
+                "transport": "reverse_websocket",
+                "connected": True,
+                "connected_at": _iso_now(),
+                "last_event_at": previous.get("last_event_at"),
+                "last_heartbeat_at": previous.get("last_heartbeat_at"),
+                "heartbeat_interval_ms": previous.get("heartbeat_interval_ms"),
+                "online": previous.get("online"),
+                "good": previous.get("good"),
+                "last_error": None,
+            }
+        )
+        assert self._session_id is not None
+        return self._session_id
+
+    def record_event_received(self) -> None:
+        current = self._transport_status()
+        self._set_transport_status(
+            {
+                **{key: value for key, value in current.items() if key != "updated_at"},
+                "transport": "reverse_websocket",
+                "connected": True,
+                "last_event_at": _iso_now(),
+                "last_error": None,
+            }
+        )
+
+    def end_event_session(
+        self,
+        *,
+        reason: str,
+        open_gap: bool = True,
+        confidence: str = "confirmed",
+        session_id: str | None = None,
+    ) -> None:
+        if session_id is not None and session_id != self._session_id:
+            with suppress(KeyError):
+                self.store.end_collector_session(session_id, reason=reason)
+            return
+        if self._session_id is not None:
+            with suppress(KeyError):
+                self.store.end_collector_session(self._session_id, reason=reason)
+            self._session_id = None
+        if open_gap:
+            self._open_outage(
+                source="event_disconnect",
+                confidence=confidence,
+            )
+        previous = self._transport_status()
+        self._set_transport_status(
+            {
+                **{key: value for key, value in previous.items() if key != "updated_at"},
+                "transport": "reverse_websocket",
+                "connected": False,
+                "last_error": reason[:500],
+            }
+        )
 
     async def run_sse_forever(self) -> None:
         delay = 1.0
@@ -620,28 +794,302 @@ class NapCatRuntime:
                 LOGGER.warning("主动刷新群列表失败：%s", error)
             await asyncio.sleep(self.config.group_discovery_interval_seconds)
 
+    def _write_session_health(self, **updates: Any) -> dict[str, Any]:
+        previous = self.store.runtime_status("session_health")
+        value = {key: value for key, value in previous.items() if key != "updated_at"}
+        value.update(updates)
+        self.store.set_runtime_status("session_health", value)
+        return self.store.runtime_status("session_health")
+
+    async def _automatic_history_recovery(
+        self,
+        gaps: list[dict[str, Any]],
+        *,
+        recovery_key: str,
+    ) -> dict[str, Any]:
+        enabled = [group for group in self.store.list_groups() if group["roleplay_enabled"]]
+        if not enabled:
+            return {"status": "skipped", "reason": "没有启用的跑团群"}
+        if self.store.history_actions_in_last_24_hours() >= 30:
+            return {"status": "skipped", "reason": "历史请求已达到 24 小时安全上限"}
+        group = enabled[0]
+        group_id = str(group["qq_group_id"])
+        target = next(
+            (item for item in self.store.sync_targets() if item.group_id == group_id),
+            None,
+        )
+        if target is None:
+            return {"status": "skipped", "reason": "找不到同步目标"}
+        source = f"automatic_login_recovery:{group_id}"
+        self._write_session_health(
+            recovery_history_attempted_for=recovery_key,
+            recovery_history_attempted_at=_iso_now(),
+        )
+        try:
+            service = SyncService(
+                self.config,
+                target,
+                self.client,
+                self.store,
+                self.manager.limiter,
+            )
+            with onebot_action_source(self.client, source):
+                result = await service.sync_recent_page()
+            repaired: list[str] = []
+            unresolved: list[str] = []
+            for original in gaps:
+                if str(original["group_id"]) != group_id:
+                    continue
+                refreshed = self.store.refresh_message_gap_boundaries(str(original["gap_id"]))
+                has_before_boundary = bool(refreshed.get("before_message_id"))
+                if result.boundary_found and has_before_boundary:
+                    self.store.update_message_gap_repair(
+                        str(refreshed["gap_id"]),
+                        status="repaired",
+                        increment_pages=True,
+                    )
+                    repaired.append(str(refreshed["gap_id"]))
+                else:
+                    self.store.update_message_gap_repair(
+                        str(refreshed["gap_id"]),
+                        status="paused",
+                        increment_pages=True,
+                        error="登录恢复只允许单页补偿，未验证已知边界",
+                    )
+                    unresolved.append(str(refreshed["gap_id"]))
+            return {
+                "status": "completed",
+                "group_id": group_id,
+                "received": result.received,
+                "inserted": result.inserted,
+                "boundary_found": result.boundary_found,
+                "repaired_gap_ids": repaired,
+                "unresolved_gap_ids": unresolved,
+            }
+        except Exception as error:
+            for original in gaps:
+                if str(original["group_id"]) == group_id:
+                    self.store.update_message_gap_repair(
+                        str(original["gap_id"]),
+                        status="paused",
+                        increment_pages=True,
+                        error=f"自动单页补偿失败：{type(error).__name__}: {error}",
+                    )
+            return {
+                "status": "failed",
+                "group_id": group_id,
+                "error": f"{type(error).__name__}: {error}"[:500],
+            }
+
+    async def _check_session_status(self, now: datetime) -> None:
+        current = self.store.runtime_status("session_health")
+        checked_at = now.isoformat()
+        try:
+            with onebot_action_source(self.client, "session_watchdog"):
+                status = await self.client.get_status()
+        except OneBotConfigurationError as error:
+            if self.manager.is_active():
+                self.manager.pause_configuration(error, source="session_watchdog")
+            self._open_outage(
+                source="onebot_unreachable",
+                confidence="confirmed",
+                start_at=int(now.timestamp()),
+            )
+            self._write_session_health(
+                qq_online=False,
+                onebot_reachable=False,
+                offline_since=current.get("offline_since") or checked_at,
+                online_since=None,
+                consecutive_online_checks=0,
+                recovery_state="configuration_error",
+                offline_reason=str(error)[:500],
+                last_status_check_at=checked_at,
+            )
+            return
+        except (OneBotTransportError, OSError, httpx.HTTPError) as error:
+            if self.manager.is_active():
+                self.manager.pause_session(
+                    OneBotSessionError("NapCat 本地接口不可达"),
+                    source="session_watchdog",
+                )
+            self._open_outage(
+                source="onebot_unreachable",
+                confidence="confirmed",
+                start_at=int(now.timestamp()),
+            )
+            self._write_session_health(
+                qq_online=False,
+                onebot_reachable=False,
+                offline_since=current.get("offline_since") or checked_at,
+                online_since=None,
+                consecutive_online_checks=0,
+                recovery_state="offline",
+                offline_reason=f"{type(error).__name__}: {error}"[:500],
+                last_status_check_at=checked_at,
+            )
+            return
+
+        online = bool(status.get("online"))
+        if not online:
+            if self.manager.is_active():
+                self.manager.pause_session(
+                    OneBotSessionError("NapCat 本地状态报告 QQ 已离线"),
+                    source="session_watchdog",
+                )
+            self._open_outage(
+                source="session_offline",
+                confidence="confirmed",
+                start_at=int(now.timestamp()),
+            )
+            self._write_session_health(
+                qq_online=False,
+                onebot_reachable=True,
+                offline_since=current.get("offline_since") or checked_at,
+                online_since=None,
+                consecutive_online_checks=0,
+                recovery_state="offline",
+                offline_reason="NapCat 本地状态报告 QQ 已离线",
+                last_status_check_at=checked_at,
+            )
+            return
+
+        control = self.store.runtime_status("collection_control")
+        if control.get("status") in {"paused_manual", "paused_configuration"}:
+            self._write_session_health(
+                qq_online=True,
+                onebot_reachable=True,
+                online_since=current.get("online_since") or checked_at,
+                consecutive_online_checks=int(current.get("consecutive_online_checks") or 0) + 1,
+                recovery_state=str(control.get("status")),
+                offline_reason=control.get("reason"),
+                last_status_check_at=checked_at,
+            )
+            return
+
+        if control.get("status") != "paused_session":
+            self._write_session_health(
+                qq_online=True,
+                onebot_reachable=True,
+                offline_since=None,
+                online_since=current.get("online_since") or checked_at,
+                consecutive_online_checks=int(current.get("consecutive_online_checks") or 0) + 1,
+                recovery_state="active",
+                offline_reason=None,
+                last_status_check_at=checked_at,
+            )
+            return
+
+        online_since_text = current.get("online_since")
+        try:
+            online_since = (
+                datetime.fromisoformat(str(online_since_text)) if online_since_text else now
+            )
+        except ValueError:
+            online_since = now
+        consecutive = int(current.get("consecutive_online_checks") or 0) + 1
+        quiet_elapsed = max(0.0, (now - online_since).total_seconds())
+        self._write_session_health(
+            qq_online=True,
+            onebot_reachable=True,
+            online_since=online_since.isoformat(),
+            consecutive_online_checks=consecutive,
+            recovery_state="stabilizing",
+            offline_reason=control.get("reason"),
+            last_status_check_at=checked_at,
+        )
+        if consecutive < 2 or quiet_elapsed < RECOVERY_QUIET_SECONDS:
+            return
+
+        try:
+            async with self.manager.limiter:
+                with onebot_action_source(self.client, "automatic_login_verification"):
+                    login = await self.client.get_login_info()
+            actual = str(login.get("user_id") or "")
+            if actual != self.config.account_id:
+                raise AccountMismatchError(
+                    f"NapCat 当前登录 QQ {actual or '未知'}，配置要求 {self.config.account_id}"
+                )
+        except Exception as error:
+            self.manager.pause_session(error, source="automatic_login_verification")
+            self._write_session_health(
+                recovery_state="verification_failed",
+                offline_reason=f"{type(error).__name__}: {error}"[:500],
+            )
+            return
+
+        recovery_key = str(current.get("offline_since") or checked_at)
+        self.manager.activate_verified(source="automatic_login_recovery")
+        gaps = self.store.close_open_message_gaps(
+            end_at=int(now.timestamp()),
+            automatic_only=True,
+        )
+        history = await self._automatic_history_recovery(
+            gaps,
+            recovery_key=recovery_key,
+        )
+        self._write_session_health(
+            qq_online=True,
+            onebot_reachable=True,
+            offline_since=None,
+            recovery_state="active",
+            offline_reason=None,
+            recovered_at=_iso_now(),
+            recovery_history=history,
+        )
+
+    async def refresh_recent_messages(self, group_id: str) -> dict[str, Any]:
+        self.manager.require_active()
+        health = self.health_snapshot()
+        if not health["safe_to_roleplay"]:
+            raise CollectionPausedError("QQ 会话或事件链路尚未达到安全就绪状态")
+        source = f"explicit_recent_refresh:{group_id}"
+        cooldown = self.store.onebot_action_cooldown(
+            "get_group_msg_history",
+            source,
+            cooldown_seconds=EXPLICIT_HISTORY_COOLDOWN_SECONDS,
+        )
+        if not cooldown["allowed"]:
+            raise RuntimeError(f"该群历史刷新冷却中，请等待 {cooldown['remaining_seconds']} 秒")
+        if self.store.history_actions_in_last_24_hours() >= 30:
+            raise RuntimeError("过去 24 小时历史请求已达到 30 页安全上限")
+        target = next(
+            (item for item in self.store.sync_targets() if item.group_id == group_id),
+            None,
+        )
+        if target is None:
+            raise KeyError("群尚未授权 AI 访问")
+        service = SyncService(
+            self.config,
+            target,
+            self.client,
+            self.store,
+            self.manager.limiter,
+        )
+        try:
+            with onebot_action_source(self.client, source):
+                result = await service.sync_recent_page()
+        except OneBotSessionError as error:
+            self.manager.pause_session(error, source="explicit_recent_refresh")
+            raise
+        return {
+            "status": "completed",
+            "received": result.received,
+            "inserted": result.inserted,
+            "boundary_found": result.boundary_found,
+            "complete": result.complete,
+            "cooldown_seconds": EXPLICIT_HISTORY_COOLDOWN_SECONDS,
+        }
+
     async def run_watchdog_forever(self) -> None:
         while True:
             now = _utc_now()
-            sse = self.store.runtime_status("sse")
-            heartbeat_at = sse.get("last_heartbeat_at")
-            heartbeat_age: float | None = None
-            if isinstance(heartbeat_at, str):
-                try:
-                    heartbeat_age = max(
-                        0.0, (now - datetime.fromisoformat(heartbeat_at)).total_seconds()
-                    )
-                except ValueError:
-                    heartbeat_age = None
-            interval_ms = int(sse.get("heartbeat_interval_ms") or 30_000)
+            transport = self._transport_status()
+            heartbeat_age = _age_seconds(transport.get("last_heartbeat_at"))
+            interval_ms = int(transport.get("heartbeat_interval_ms") or 30_000)
             threshold = max(60.0, interval_ms * 3 / 1000)
-            # Some NapCat builds never emit heartbeat meta events. In that case
-            # the open SSE transport, rather than an absent heartbeat, is the
-            # only available health signal.
             heartbeat_observed = heartbeat_age is not None
             stale = bool(
-                self.manager.is_active()
-                and sse.get("connected")
+                transport.get("connected")
                 and heartbeat_age is not None
                 and heartbeat_age > threshold
             )
@@ -661,9 +1109,11 @@ class NapCatRuntime:
                     "heartbeat_observed": heartbeat_observed,
                     "heartbeat_timeout_seconds": threshold,
                     "heartbeat_stale": stale,
+                    "status_check_interval_seconds": STATUS_CHECK_INTERVAL_SECONDS,
                 },
             )
-            await asyncio.sleep(10)
+            await self._check_session_status(now)
+            await asyncio.sleep(STATUS_CHECK_INTERVAL_SECONDS)
 
     def pause_collection(self, reason: str, *, source: str = "admin_mcp") -> dict[str, Any]:
         self._open_outage(
@@ -675,6 +1125,12 @@ class NapCatRuntime:
         return self.manager.pause_for(reason, source=source)
 
     async def resume_collection(self) -> dict[str, Any]:
+        control = self.store.runtime_status("collection_control")
+        health = self.health_snapshot()
+        if control.get("status") == "paused_session" and health.get("recovery_state") != "active":
+            raise CollectionPausedError(
+                "重新登录后仍处于五分钟稳定观察期；不能人工跳过会话安全检查"
+            )
         return await self.manager.resume()
 
     def request_account_switch(self, switch_id: str) -> Path:
@@ -735,6 +1191,26 @@ class NapCatRuntime:
         target = str(switch["target_account_id"])
         if self.config.account_id != target:
             raise RuntimeError("应用尚未由宿主机切换到目标账号配置")
+        health = self.store.runtime_status("session_health")
+        online_since = health.get("online_since")
+        try:
+            online_age = (
+                (_utc_now() - datetime.fromisoformat(str(online_since))).total_seconds()
+                if online_since
+                else 0
+            )
+        except ValueError:
+            online_age = 0
+        if (
+            health.get("qq_online") is not True
+            or int(health.get("consecutive_online_checks") or 0) < 2
+            or online_age < RECOVERY_QUIET_SECONDS
+        ):
+            remaining = max(1, int(RECOVERY_QUIET_SECONDS - online_age))
+            raise RuntimeError(
+                "目标 QQ 登录后需保持五分钟稳定，并由本地状态连续确认两次；"
+                f"请约 {remaining} 秒后再完成切换"
+            )
         async with self.manager.limiter:
             with onebot_action_source(self.client, "account_switch_finalize"):
                 login = await self.client.get_login_info()

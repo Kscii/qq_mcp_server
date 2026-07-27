@@ -12,11 +12,18 @@ from qq_mcp_server.store import MessageStore
 
 
 class RuntimeClient:
-    def __init__(self, *, listed: bool = False) -> None:
+    def __init__(self, *, listed: bool = False, online: bool = True) -> None:
         self.listed = listed
+        self.online = online
+        self.actions: list[str] = []
 
     async def get_login_info(self) -> dict[str, Any]:
+        self.actions.append("get_login_info")
         return {"user_id": "1", "nickname": "测试账号"}
+
+    async def get_status(self) -> dict[str, Any]:
+        self.actions.append("get_status")
+        return {"online": self.online, "good": self.online}
 
     async def get_group_list(self) -> list[dict[str, Any]]:
         if not self.listed:
@@ -43,6 +50,7 @@ class RuntimeClient:
     async def get_group_history(
         self, group_id: str, count: int, *, message_seq: str | None = None
     ) -> list[dict[str, Any]]:
+        self.actions.append("get_group_history")
         return []
 
 
@@ -124,7 +132,7 @@ async def test_sse_account_mismatch_persistently_pauses_collection(
     assert runtime.manager.is_active() is False
     control = store.runtime_status("collection_control")
     assert control["status"] == "paused_session"
-    assert control["source"] == "sse_event"
+    assert control["source"] == "event_transport"
 
 
 async def test_group_registry_error_never_authorizes_napcat_restart(
@@ -187,6 +195,65 @@ async def test_watchdog_does_not_invent_gap_when_napcat_never_sent_heartbeat(
     assert watchdog["heartbeat_observed"] is False
     assert watchdog["heartbeat_stale"] is False
     assert store.list_message_gaps(group_id="2", unresolved_only=True) == []
+
+
+async def test_local_offline_status_pauses_once_and_opens_one_gap(config: AppConfig) -> None:
+    store = MessageStore(config.database_path)
+    store.upsert_group_candidate("2", "测试群", source="group_message_event")
+    client = RuntimeClient(online=False)
+    runtime = NapCatRuntime(
+        config,
+        client,  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+    now = datetime.now(UTC)
+
+    await runtime._check_session_status(now)
+    await runtime._check_session_status(now + timedelta(minutes=1))
+
+    control = store.runtime_status("collection_control")
+    health = store.runtime_status("session_health")
+    gaps = store.list_message_gaps(group_id="2", unresolved_only=True)
+    assert control["status"] == "paused_session"
+    assert health["recovery_state"] == "offline"
+    assert health["qq_online"] is False
+    assert len(gaps) == 1
+    assert client.actions == ["get_status", "get_status"]
+
+
+async def test_recovery_waits_five_minutes_then_verifies_once(config: AppConfig) -> None:
+    store = MessageStore(config.database_path)
+    store.upsert_group_candidate("2", "测试群", source="group_message_event")
+    client = RuntimeClient(online=True)
+    runtime = NapCatRuntime(
+        config,
+        client,  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+    runtime.manager.pause_session(RuntimeError("掉线"), source="test")
+    started = datetime.now(UTC)
+    store.set_runtime_status(
+        "session_health",
+        {
+            "qq_online": True,
+            "onebot_reachable": True,
+            "offline_since": (started - timedelta(minutes=1)).isoformat(),
+            "online_since": started.isoformat(),
+            "consecutive_online_checks": 1,
+            "recovery_state": "stabilizing",
+        },
+    )
+
+    await runtime._check_session_status(started + timedelta(minutes=4, seconds=59))
+    assert store.runtime_status("collection_control")["status"] == "paused_session"
+    assert client.actions == ["get_status"]
+
+    await runtime._check_session_status(started + timedelta(minutes=5))
+    assert store.runtime_status("collection_control")["status"] == "active"
+    assert store.runtime_status("session_health")["recovery_state"] == "active"
+    assert client.actions == ["get_status", "get_status", "get_login_info"]
 
 
 def test_sync_error_does_not_make_stale_state_look_fresh(config: AppConfig) -> None:

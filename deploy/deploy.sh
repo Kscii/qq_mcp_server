@@ -58,8 +58,16 @@ if [ -z "$app_image" ]; then
     echo "deploy.env 中缺少 APP_IMAGE" >&2
     exit 2
 fi
+collector_image="$(sed -n 's/^COLLECTOR_IMAGE=//p' deploy.env | head -n 1)"
+if [ -z "$collector_image" ]; then
+    echo "deploy.env 中缺少 COLLECTOR_IMAGE" >&2
+    exit 2
+fi
 if ! docker image inspect "$app_image" >/dev/null 2>&1; then
     docker pull "$app_image"
+fi
+if ! docker image inspect "$collector_image" >/dev/null 2>&1; then
+    docker pull "$collector_image"
 fi
 schema_version="$(
     python3 -c '
@@ -170,6 +178,29 @@ PY
     profile_migrated=1
 fi
 
+collector_first_install=0
+if ! docker container inspect qq-mcp-server-collector >/dev/null 2>&1; then
+    collector_first_install=1
+fi
+deploy_collector="${DEPLOY_COLLECTOR:-0}"
+case "$deploy_collector" in
+    0|1) ;;
+    *) echo "DEPLOY_COLLECTOR 只能是 0 或 1" >&2; exit 2 ;;
+esac
+
+if [ "$collector_first_install" -eq 1 ]; then
+    # 一次性从 HTTP-SSE 迁移到反向 WebSocket。先写新配置，再停止占用
+    # 3001 端口的 NapCat，启动采集器，最后只启动 NapCat 一次。
+    compose run --rm --no-deps app \
+        -c /config/config.toml prepare-napcat /data/napcat/config
+    compose stop napcat >/dev/null 2>&1 || true
+    docker update --restart=no qq-mcp-server-napcat >/dev/null 2>&1 || true
+    compose up -d --no-deps collector
+    compose up -d --no-deps napcat
+elif [ "$deploy_collector" = "1" ]; then
+    compose up -d --no-deps collector
+fi
+
 if grep -q '^PUBLIC_DOMAIN=.' .env; then
     compose --profile public pull caddy
     if [ "$profile_migrated" -eq 1 ]; then
@@ -186,13 +217,15 @@ fi
 attempt=0
 while [ "$attempt" -lt 18 ]; do
     health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' qq-mcp-server-app 2>/dev/null || true)"
-    if [ "$health" = "healthy" ]; then
+    collector_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' qq-mcp-server-collector 2>/dev/null || true)"
+    if [ "$health" = "healthy" ] && [ "$collector_health" = "healthy" ]; then
         rm -f "$migration_marker"
         compose ps
         exit 0
     fi
-    if [ "$health" = "unhealthy" ]; then
+    if [ "$health" = "unhealthy" ] || [ "$collector_health" = "unhealthy" ]; then
         docker logs --tail 100 qq-mcp-server-app >&2 || true
+        docker logs --tail 100 qq-mcp-server-collector >&2 || true
         exit 1
     fi
     attempt=$((attempt + 1))
@@ -200,5 +233,6 @@ while [ "$attempt" -lt 18 ]; do
 done
 
 docker logs --tail 100 qq-mcp-server-app >&2 || true
+docker logs --tail 100 qq-mcp-server-collector >&2 || true
 echo "服务在 90 秒内未通过健康检查" >&2
 exit 1

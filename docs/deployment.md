@@ -1,13 +1,14 @@
 # Google Cloud 部署
 
-当前生产设计是一台 Ubuntu VM、Docker Compose，以及 NapCat、应用和可选 Caddy 三个
-容器。NapCat 与应用使用 host network，但分别只监听
-`127.0.0.1:3000/3001/6099` 和 `127.0.0.1:8000`；Caddy 是唯一公网入口。建议 2 vCPU、
-4 GB 内存、30 GB 磁盘和 2 GB swap。
+当前生产设计是一台 Ubuntu VM、Docker Compose，以及 NapCat、collector、API 和可选
+Caddy 四个容器。它们使用 host network，但只监听回环地址：OneBot HTTP 3000、反向
+WebSocket collector 3001、NapCat WebUI 6099、API 8000；Caddy 是唯一公网入口。
+建议 2 vCPU、4 GB 内存、30 GB 磁盘和 2 GB swap。
 
-应用发布与 QQ 客户端生命周期通常分离：普通部署只替换应用和可选 Caddy，不拉取、
-更新或重启 NapCat。v0.6 首次升级是例外，它会停止 NapCat 一次，把现有登录目录复制到
-当前 QQ 的独立账号目录并重建容器；原目录保留，迁移后不会重复执行。
+API、collector 与 QQ 客户端生命周期分离：普通 API 部署不更新 collector，也不拉取、
+更新或重启 NapCat。首次启用反向 WebSocket collector 时是一次性例外：部署先写入
+NapCat 配置，停止 NapCat 一次，启动 collector，再启动 NapCat 一次。之后只有 collector
+相关源文件变化才替换 collector，仍不会重启 NapCat。
 
 ## 一次性准备
 
@@ -40,7 +41,8 @@ CONFIRM_NAPCAT_MAINTENANCE=yes ./maintain-napcat.sh initialize
 ./maintain-napcat.sh apply-restart-policy
 ```
 
-该动作只把策略改为连续失败最多重启两次，不重启容器。
+该动作把 NapCat 的 Docker 重启策略设为 `no`，不会当场重启容器。QQ 下线后必须人工
+判断并登录，系统不会通过自动重启制造重复登录。
 
 首次启动时可以先用 SSH 转发打开 NapCat：
 
@@ -51,8 +53,9 @@ gcloud compute ssh qq-mcp-server --zone australia-southeast1-a \
 
 打开 `http://127.0.0.1:6099/webui` 扫码。QQ 登录目录在持久卷，正常重启无需重新扫码；
 QQ 仍可能因设备授权或风控要求重新授权。不要在部署配置中保存主用 QQ 明文密码。确认
-账号无误后，在管理 MCP 调用 `admin.resume_qq_collection`；它只做一次账号校验，成功后
-才解除持久化暂停。v0.6 之后推荐使用账号登记/切换流程，不要直接手改 `.env`。
+账号无误后等待状态页显示稳定恢复。会话离线后，collector 会观察五分钟、连续确认两次
+并校验账号，随后只补一页历史；不要反复点登录或重启 NapCat。人工维护暂停则仍由管理
+MCP 调用 `admin.resume_qq_collection`。账号切换使用登记/切换流程，不要直接改 `.env`。
 
 ## Tailscale 私有 NapCat 面板
 
@@ -90,7 +93,7 @@ MCP 返回值；最终页面也只有已登录 Tailnet 的设备能够访问。
 `qq-mcp-account-switch.path/service`。应用没有 Docker Socket，
 只能写入固定 `restart-napcat.request`；助手校验 UID、0600 权限、一小时冷却和 24 小时
 最多两次的预算后，只执行 `docker restart --time 30 qq-mcp-server-napcat`。登录失效、
-账号不匹配或互踢不会触发恢复入口，而会持久化暂停等待人工处理。不要把这个助手改成
+账号不匹配或互踢不会自动触发恢复入口，而会持久化暂停等待人工处理。不要把这个助手改成
 接受容器名或命令参数。切号助手只接受固定 JSON 请求，目标必须是已登记纯数字 QQ；
 它更新固定 `.env` 字段、选择账号专属登录目录并只重建一个 NapCat 和应用容器。
 
@@ -104,8 +107,7 @@ MCP 返回值；最终页面也只有已登录 Tailnet 的设备能够访问。
    持久化暂停状态；数据库迁移本身不会连接 OneBot。
 4. v0.6 首次账号目录迁移会停止 NapCat 一次；若账号仍冻结，不要在部署后恢复采集。
 5. 新应用健康检查失败时，发布脚本先原子恢复迁移前备份，再回滚旧镜像。
-6. 账号解冻并在固定设备完成登录后，先看缓存状态，再由用户明确调用
-   `admin.resume_qq_collection`。
+6. 账号解冻并在固定设备完成登录后，先看缓存状态，等待五分钟稳定观察与一次自动补页。
 
 应用健康检查只打开数据库和规则索引，不探测 QQ，因此冻结期间也能安全完成部署。
 
@@ -151,6 +153,22 @@ MCP_STORAGE_ENCRYPTION_KEY=...
 Google OAuth Web Application 回调地址必须精确填写
 `https://qq-mcp.example.com/auth/callback`。两个 MCP App 共用同一 OAuth 提供方和完整
 邮箱白名单。Caddy 自动申请证书；不要公开 3000、6099 或 8000 端口。
+
+还应把 VM 当前出口地址提升为区域静态地址，避免停止/启动后 QQ 登录 IP 无故变化。若
+当前外部地址仍是 `35.189.4.24`，可在不重启 VM 的情况下保留它：
+
+```bash
+gcloud compute addresses create qq-mcp-server-egress \
+  --project=project-51b589c7-8d5e-4e78-a10 \
+  --region=australia-southeast1 \
+  --addresses=35.189.4.24
+gcloud compute addresses describe qq-mcp-server-egress \
+  --project=project-51b589c7-8d5e-4e78-a10 \
+  --region=australia-southeast1
+```
+
+执行前必须先核对实例当前外部 IP；地址不同就使用实际值，不要强行申请旧地址。固定出口
+只能减少 IP 漂移，不能消除非官方 QQ 客户端自身的账号风险。
 
 连接 ChatGPT 时先添加 `https://qq-mcp.example.com/mcp/admin`。通过管理 App 加群并完成
 配置后，`admin.list_groups` 会返回每个群唯一的
@@ -203,14 +221,15 @@ gcloud compute ssh "$INSTANCE" \
 2. 构建 wheel 并创建 GitHub Release。
 3. 通过 GitHub OIDC 获取短期 Google 凭证。
 4. 构建镜像并推送到 Artifact Registry。
-5. 以镜像 digest 部署；健康检查失败则恢复上一 digest。
+5. 以镜像 digest 部署 API；仅当 collector 相关文件变化时同步更新 collector。
+6. API 或 collector 健康检查失败则回滚镜像；发布过程不会自动重启 NapCat。
 
-普通 `main` 推送只运行 CI。`deploy.sh` 仅更新应用和可选 Caddy；应用健康检查调用
-`status --json`，不要求 QQ 当时在线。SQLite、人物卡、规则索引和 OAuth 状态都在
-`DATA_DIR` 持久卷中。
+普通 `main` 推送只运行 CI。`deploy.sh` 更新 API、按需更新 collector 和可选 Caddy；
+健康检查不要求 QQ 当时在线。SQLite、人物卡、规则索引和 OAuth 状态都在 `DATA_DIR`
+持久卷中。
 
 v0.6 首次发布会把本项目 schema v2/v3 原子升级为 v4，并保留迁移前备份；不需要
-重新授权群或上传人物卡。它同时启用纯 SSE、消息缺口、OneBot 调用审计和多 QQ 账号表。
+重新授权群或上传人物卡。它同时启用消息缺口、OneBot 调用审计和多 QQ 账号表。
 旧 qq_mcp_server/Dice Echo 数据仍不支持迁移。
 
 ## 切换备用 QQ
@@ -220,7 +239,7 @@ v0.6 首次发布会把本项目 schema v2/v3 原子升级为 v4，并保留迁�
 1. `admin.open_qq_account_registration` 登记目标 QQ。
 2. `admin.begin_qq_account_switch` 取得浏览器确认页。
 3. 确认后等待约 20 秒，打开 `admin.open_napcat_webui` 返回的私有入口登录目标账号。
-4. 登录完成后调用 `admin.complete_qq_account_switch`。
+4. 登录完成后保持五分钟，不要重复登录；再调用 `admin.complete_qq_account_switch`。
 
 每个账号登录目录位于
 `/var/lib/qq_mcp_server/napcat/accounts/<QQ>/qq`；SQLite、cards、rules 和 oauth 不随
@@ -229,10 +248,10 @@ v0.6 首次发布会把本项目 schema v2/v3 原子升级为 v4，并保留迁�
 ## 未来将 NapCat 移到住宅网络
 
 公网 MCP、OAuth、Caddy 和 SQLite 默认继续留在 GCP。到澳洲后先保持这套部署观察至少
-30 天；若账号仍有明显地域风险，再只把 NapCat 移到长期稳定的住宅设备。住宅端不需要
-公网 IP 或端口转发：GCP VM 与住宅设备加入同一个 Tailnet，应用的 `ONEBOT_URL` 和
-`onebot_sse_url` 改为住宅设备的 `.ts.net` HTTPS 私网地址，并用 Tailscale ACL 只允许
-GCP VM 访问。
+30 天；若账号仍有明显地域风险，再只把 NapCat 移到长期稳定的住宅设备。反向
+WebSocket 不能直接跨 NAT 连接 GCP 回环 collector，因此迁移前需要增加受 Tailscale ACL
+保护的私网 collector 地址，或在住宅端运行转发代理；不能只修改旧的
+`onebot_sse_url`。该扩展尚未实现。
 
 切换时必须先暂停采集并确保旧 NapCat 已停止，再启动新位置；任何时候都不得让两个
 NapCat 实例同时登录同一 QQ。此方案只改变 QQ 客户端位置，不改变 ChatGPT 访问公网 MCP

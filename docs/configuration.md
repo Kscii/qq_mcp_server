@@ -26,14 +26,16 @@ NapCat 私有跳转和只读模组面板；资料修改尽量留在带结构化�
 qq_mcp_server setup
 qq_mcp_server build-rules --investigator INVESTIGATOR.pdf --keeper KEEPER.pdf --magic MAGIC.pdf
 qq_mcp_server run
+qq_mcp_server run-api
+qq_mcp_server run-collector
 qq_mcp_server status [--json]
 qq_mcp_server backup
 qq_mcp_server pause-collection --reason "维护"
 qq_mcp_server prepare-napcat DIRECTORY
 ```
 
-`status`、`backup` 和 `pause-collection` 不连接 QQ。v0.6 不再提供主动 `sync` 命令；
-正常采集只消费 SSE，历史只通过消息缺口流程人工启动。
+`run` 是本地兼容入口；生产环境分别运行 `run-api` 和 `run-collector`。`status`、
+`backup` 和 `pause-collection` 不连接 QQ。正常采集只消费反向 WebSocket 事件。
 
 ## TOML 与环境变量
 
@@ -44,14 +46,15 @@ qq_mcp_server prepare-napcat DIRECTORY
 
 - `account_id` / `QQ_ACCOUNT_ID`：当前唯一运行的 NapCat QQ。
 - `onebot_url` / `ONEBOT_URL`：回环 HTTP 或 Tailnet `.ts.net` HTTPS。
-- `onebot_sse_url` / `ONEBOT_SSE_URL`：同上，路径必须为 `/_events`。
+- `onebot_sse_url` / `ONEBOT_SSE_URL`：仅为旧配置兼容而保留，反向 WebSocket
+  collector 不读取它。
 - `page_size`：人工缺口修复的历史分页大小。
 - `initial_collection_paused` / `INITIAL_COLLECTION_PAUSED`：首次创建控制状态时是否暂停。
 - `request_timeout_seconds` / `history_timeout_seconds`：普通/历史接口超时。
 
 `poll_interval_seconds`、`registry_refresh_seconds`、`group_discovery_interval_seconds`、
 `context_freshness_seconds`、`sync_concurrency`、`backfill_*`、`unreachable_backoff_max_seconds`
-和 `history_since` 仍可读取旧配置，但 v0.6 的常驻服务不再运行周期历史/群列表调度器。
+和 `history_since` 仍可读取旧配置，但常驻服务不运行周期历史/群列表调度器。
 
 `[storage]`：
 
@@ -92,7 +95,7 @@ schema v2/v3 会在首次 v0.6 部署前备份并原子升级到 schema v4，保
 7. 上传固定模板人物卡并确认。
 8. 回到管理 App 启用群。
 
-所有群消息都会经 SSE 入库；访问授权只控制 AI 是否能读，启停只控制跑团工具。
+所有群消息都会经反向 WebSocket 入库；访问授权只控制 AI 是否能读，启停只控制跑团工具。
 
 ## QQ 账号登记与切换
 
@@ -101,10 +104,12 @@ schema v2/v3 会在首次 v0.6 部署前备份并原子升级到 schema v4，保
 3. `admin.begin_qq_account_switch(target_account_id)`：打开浏览器确认页。
 4. 确认后旧 NapCat 停止，服务切到目标账号专属目录并保持采集暂停。
 5. `admin.open_napcat_webui`：在 Tailscale 私有面板登录目标 QQ。
-6. 登录成功后调用 `admin.complete_qq_account_switch(switch_id)`。
+6. 登录成功后保持五分钟，不要重复登录或重启；状态连续确认两次后调用
+   `admin.complete_qq_account_switch(switch_id)`。
 
-最后一步只执行一次登录信息和一次强制群列表读取。账号或群不匹配时保持目标账号和暂停
-状态，不自动切回、不自动重试。失败后同一目标冷却 30 分钟，24 小时最多三次失败。
+最后一步在稳定期之前会拒绝执行；通过后只执行一次登录信息和一次强制群列表读取。账号
+或群不匹配时保持目标账号和暂停状态，不自动切回、不自动重试。失败后同一目标冷却
+30 分钟，24 小时最多三次失败。
 
 所有登记账号被视为同一玩家的 QQ 别名，共享群数据。一个时刻仍只有一个采集账号。
 
@@ -146,6 +151,7 @@ QQ 账号：
 
 - `trpg.get_status`
 - `trpg.open_campaign_dashboard`
+- `trpg.get_recent_messages`
 - `trpg.get_roleplay_context`
 - `trpg.get_character_card`
 - `trpg.search_messages`
@@ -155,8 +161,10 @@ QQ 账号：
 - `trpg.list_changes`
 - `trpg.undo_change`
 
-群工具的群作用域来自 URL。`get_roleplay_context` 在 SSE 未确认健康、采集暂停或返回范围
-与未解决缺口重叠时拒绝提供可能误导的上下文。
+群工具的群作用域来自 URL。`get_roleplay_context` 和 `get_recent_messages` 即使在 QQ
+离线时也会返回可用缓存，但同时返回健康状态、警告代码和缺口；只有
+`safe_to_roleplay=true` 才能把它当作实时完整上下文。`get_recent_messages` 默认不触发
+OneBot；只有显式传入 `refresh=true` 才读取一页历史，并受每群十分钟冷却和全局预算限制。
 
 ## AI 路由
 

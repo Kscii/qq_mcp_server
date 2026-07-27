@@ -465,7 +465,7 @@ def _readiness(store: MessageStore, rules: RuleIndex, group: dict[str, Any]) -> 
         },
         {
             "id": "messages",
-            "label": "群消息由常开 SSE 实时采集，不执行自动历史轮询",
+            "label": "群消息由常开反向 WebSocket 被动采集，不执行周期历史轮询",
             "complete": True,
         },
     ]
@@ -502,7 +502,7 @@ def _setup_instruction(check_id: str) -> str:
         "player": "先列出成员，再调用 admin.set_member_roles 绑定 player QQ。",
         "card": "连接该群 App，调用 trpg.begin_character_card_upload。",
         "rules": "在服务器离线运行 build-rules 并挂载只读索引。",
-        "messages": "保持 NapCat SSE 在线；若有缺口，在管理 App 中人工修复。",
+        "messages": "保持 NapCat 事件连接在线；若有缺口，在管理 App 中检查或人工修复。",
     }.get(check_id, "按检查项完成配置。")
 
 
@@ -600,7 +600,7 @@ def create_mcp_servers(
         name="admin.open_group_access",
         description=(
             "当用户需要允许或禁止 AI 读取某个已采集 QQ 群时使用。"
-            "所有群仍会通过 SSE 入库；本工具只改变 MCP 访问权限。"
+            "所有群仍会通过被动事件流入库；本工具只改变 MCP 访问权限。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -635,7 +635,7 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.get_napcat_status",
         description=(
-            "从本地缓存诊断 QQ 账号、SSE 心跳、消息缺口、OneBot 调用审计和群采集状态。"
+            "从本地缓存诊断 QQ 在线状态、WebSocket 心跳、消息缺口、OneBot 调用审计和群采集状态。"
             "不会为了诊断额外请求 QQ，也不返回任何 Token。"
         ),
         annotations=_READ_ONLY,
@@ -648,7 +648,7 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.list_message_gaps",
         description=(
-            "查看 SSE 断线、QQ 掉线、应用重启或写入失败留下的消息缺口。"
+            "查看事件链路断线、QQ 掉线、采集器重启或写入失败留下的消息缺口。"
             "本工具只读本地数据库，不调用 QQ。"
         ),
         annotations=_READ_ONLY,
@@ -851,8 +851,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.complete_qq_account_switch",
         description=(
-            "仅在用户已完成目标 QQ 登录后调用。只执行一次登录信息和一次强制群列表读取；"
-            "账号正确且包含全部启用跑团群时恢复 SSE。"
+            "仅在用户已完成目标 QQ 登录并保持五分钟稳定后调用。稳定期通过后只执行一次"
+            "登录信息和一次强制群列表读取；账号正确且包含全部启用跑团群时恢复事件采集。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -872,8 +872,11 @@ def create_mcp_servers(
                 str(error),
                 next_actions=[
                     {
-                        "label": "打开 NapCat 登录",
-                        "instruction": "调用 admin.open_napcat_webui，确认目标账号已经登录。",
+                        "label": "等待稳定或检查登录",
+                        "instruction": (
+                            "若尚未登录则调用 admin.open_napcat_webui；已经登录时不要重复"
+                            "操作，等待五分钟后重新调用本工具。"
+                        ),
                     }
                 ],
             )
@@ -922,8 +925,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.resume_qq_collection",
         description=(
-            "仅在用户明确表示已完成 QQ 登录并要求恢复采集后调用。只执行一次登录账号校验；"
-            "必须与配置账号一致才解除持久化暂停。"
+            "仅在用户明确要求解除人工暂停时调用。会话掉线后的五分钟稳定观察与账号校验"
+            "不能人工跳过，满足条件后采集器会受控自动恢复。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -948,7 +951,7 @@ def create_mcp_servers(
         name="admin.refresh_group_registry",
         description=(
             "仅在用户明确要求核对当前账号加入的群时调用。执行一次登录校验和一次"
-            "no_cache 群列表读取；至少 60 秒冷却，不会自动周期调用。"
+            "no_cache 群列表读取；至少一小时冷却，不会自动周期调用。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -971,7 +974,7 @@ def create_mcp_servers(
         name="admin.probe_group",
         description=(
             "用户给出明确 QQ 群号但强制群列表中找不到时调用。"
-            "通过已收到的 SSE 事件、群资料或当前账号成员身份验证；不会读取群历史。"
+            "通过已收到的事件、群资料或当前账号成员身份验证；不会读取群历史。"
         ),
         annotations=_READ_ONLY,
         auth=auth_check,
@@ -1014,11 +1017,19 @@ def create_mcp_servers(
             issued_to=_request_email(),
             ttl_seconds=config.upload_token_ttl_seconds,
         )
+        health = runtime.health_snapshot()
         return {
             "url": napcat_webui_url(config, token),
             "expires_in_seconds": config.upload_token_ttl_seconds,
             "private_access_required": "Tailscale",
             "contains_long_lived_token": False,
+            "qq_online": health["qq_online"],
+            "recovery_state": health["recovery_state"],
+            "instruction": (
+                "QQ 已在线；不要重复登录。"
+                if health["qq_online"]
+                else "只扫码一次；登录后保持页面和服务静默，等待自动稳定检查。"
+            ),
         }
 
     @admin.tool(
@@ -1044,11 +1055,12 @@ def create_mcp_servers(
                 "NAPCAT_RESTART_NOT_NEEDED",
                 "NapCat 未处于持续不可达状态；群列表缺失、同步陈旧或人工暂停不能作为重启理由。",
             )
-        sse_updated = status["sse"].get("updated_at")
-        if isinstance(sse_updated, str):
+        transport_updated = status["event_transport"].get("updated_at")
+        if isinstance(transport_updated, str):
             try:
                 error_age = (
-                    datetime.now().astimezone() - datetime.fromisoformat(sse_updated).astimezone()
+                    datetime.now().astimezone()
+                    - datetime.fromisoformat(transport_updated).astimezone()
                 ).total_seconds()
             except ValueError:
                 error_age = 0
@@ -1134,8 +1146,16 @@ def create_mcp_servers(
             raise ValueError("limit 必须在 1 到 200 之间")
         group = store.get_group(group_key)
         runtime.manager.require_active()
+        source = f"manual_group_member_list:{group['qq_group_id']}"
+        cooldown = store.onebot_action_cooldown(
+            "get_group_member_list",
+            source,
+            cooldown_seconds=3600,
+        )
+        if not cooldown["allowed"]:
+            raise RuntimeError(f"成员列表读取冷却中，请等待 {cooldown['remaining_seconds']} 秒")
         async with runtime.manager.limiter:
-            with onebot_action_source(client, "manual_group_member_list"):
+            with onebot_action_source(client, source):
                 members = await client.get_group_member_list(str(group["qq_group_id"]))
         if query:
             lowered = query.lower()
@@ -1226,8 +1246,16 @@ def create_mcp_servers(
     ) -> dict[str, Any]:
         group = store.get_group(group_key)
         runtime.manager.require_active()
+        source = f"manual_member_role_setup:{group['qq_group_id']}"
+        cooldown = store.onebot_action_cooldown(
+            "get_group_member_list",
+            source,
+            cooldown_seconds=3600,
+        )
+        if not cooldown["allowed"]:
+            raise RuntimeError(f"成员身份校验冷却中，请等待 {cooldown['remaining_seconds']} 秒")
         async with runtime.manager.limiter:
-            with onebot_action_source(client, "manual_member_role_setup"):
+            with onebot_action_source(client, source):
                 members = await client.get_group_member_list(str(group["qq_group_id"]))
         by_id = {str(item["qq_user_id"]): item for item in members}
         players = list(dict.fromkeys([player_qq_user_id, *(player_qq_user_ids or [])]))
@@ -1281,8 +1309,8 @@ def create_mcp_servers(
     @admin.tool(
         name="admin.set_group_enabled",
         description=(
-            "仅在用户直接要求后启用或停用本群跑团工具。停用不会停止该群的 SSE 入库，"
-            "也不会改变 AI 访问授权。"
+            "仅在用户直接要求后启用或停用本群跑团工具。停用不会停止该群的被动事件"
+            "入库，也不会改变 AI 访问授权。"
         ),
         annotations=_WRITE,
         auth=auth_check,
@@ -1308,6 +1336,7 @@ def create_mcp_servers(
                 "group": _group_meta(updated),
                 "roleplay_enabled": updated["roleplay_enabled"],
                 "version": updated["version"],
+                "event_collection_continues": True,
                 "sse_collection_continues": True,
             }
         except VersionConflictError as error:
@@ -1321,7 +1350,7 @@ def create_mcp_servers(
         if not group["roleplay_enabled"]:
             return None, _error(
                 "GROUP_DISABLED",
-                "该群的跑团工具已停用；SSE 仍会保存群消息。",
+                "该群的跑团工具已停用；被动事件采集仍会保存群消息。",
                 next_actions=[
                     {
                         "label": "启用群 App",
@@ -1343,14 +1372,22 @@ def create_mcp_servers(
     async def get_status() -> dict[str, Any]:
         group = selected_group()
         state = store.state(str(group["qq_group_id"]))
+        health = runtime.health_snapshot()
         return {
             "group": _group_meta(group),
             "roleplay_enabled": group["roleplay_enabled"],
             "version": group["version"],
             "collection_control": runtime.manager.control_status(),
+            "qq_online": health["qq_online"],
+            "event_connected": health["event_connected"],
+            "data_fresh": health["data_fresh"],
+            "safe_to_roleplay": health["safe_to_roleplay"],
+            "recovery_state": health["recovery_state"],
+            "offline_reason": health["offline_reason"],
             **_readiness(store, rules, group),
             "message_state": state,
-            "sse": store.runtime_status("sse"),
+            "event_transport": health["event_transport"],
+            "sse": health["event_transport"],
             "message_gaps": store.list_message_gaps(
                 group_id=str(group["qq_group_id"]),
                 unresolved_only=True,
@@ -1412,31 +1449,8 @@ def create_mcp_servers(
             raise ValueError("since_message_id 与 before_message_id 不能同时提供")
         if not 1 <= limit <= 100:
             raise ValueError("limit 必须在 1 到 100 之间")
-        if not runtime.manager.is_active():
-            control = runtime.manager.control_status()
-            return _error(
-                "QQ_COLLECTION_PAUSED",
-                f"QQ 采集已暂停：{control.get('reason') or control.get('status')}",
-                next_actions=[
-                    {
-                        "label": "检查采集状态",
-                        "instruction": "在管理 App 调用 admin.get_napcat_status。",
-                    }
-                ],
-            )
         group_key = str(group["group_key"])
-        sse = store.runtime_status("sse")
-        if not sse.get("connected") or sse.get("online") is False or sse.get("good") is False:
-            return _error(
-                "QQ_CONTEXT_STALE",
-                "NapCat SSE 当前未确认健康，拒绝返回可能缺失最新消息的跑团上下文。",
-                next_actions=[
-                    {
-                        "label": "检查采集状态",
-                        "instruction": "在管理 App 调用 admin.get_napcat_status。",
-                    },
-                ],
-            )
+        health = runtime.health_snapshot()
         roles = store.member_roles(group_key)
         group_id = str(group["qq_group_id"])
         if before_message_id:
@@ -1471,17 +1485,6 @@ def create_mcp_servers(
             start_at=context_start,
             end_at=context_end,
         )
-        if overlapping_gaps:
-            return _error(
-                "MESSAGE_GAP_OVERLAPS_CONTEXT",
-                "本次消息范围与尚未修复的采集缺口重叠，拒绝返回不完整上下文。",
-                next_actions=[
-                    {
-                        "label": "检查消息缺口",
-                        "instruction": "在管理 App 调用 admin.list_message_gaps。",
-                    }
-                ],
-            )
         older_gaps = store.unresolved_message_gaps_before(
             group_id,
             timestamp=context_start,
@@ -1492,6 +1495,16 @@ def create_mcp_servers(
             end_at=context_end,
         )
         character = store.character(group_key)
+        warning_codes: list[str] = []
+        if not health["qq_online"]:
+            warning_codes.append("QQ_OFFLINE")
+        if not health["event_connected"] or not health["data_fresh"]:
+            warning_codes.append("EVENT_DATA_STALE")
+        if health["collection_control"].get("status") != "active":
+            warning_codes.append("COLLECTION_PAUSED")
+        if overlapping_gaps:
+            warning_codes.append("MESSAGE_GAP_OVERLAPS_CONTEXT")
+        safe_to_roleplay = bool(health["safe_to_roleplay"] and not overlapping_gaps)
         return {
             "notice": _UNTRUSTED_NOTICE,
             "prompt_version": PROMPT_VERSION,
@@ -1520,18 +1533,107 @@ def create_mcp_servers(
                 ),
             },
             "collection": {
-                "sse": sse,
+                "qq_online": health["qq_online"],
+                "event_connected": health["event_connected"],
+                "data_fresh": bool(health["data_fresh"] and not overlapping_gaps),
+                "safe_to_roleplay": safe_to_roleplay,
+                "recovery_state": health["recovery_state"],
+                "offline_reason": health["offline_reason"],
+                "last_event_at": health["last_event_at"],
+                "event_transport": health["event_transport"],
+                "sse": health["event_transport"],
                 "context_range": {
                     "start_at": context_start,
                     "end_at": context_end,
                 },
+                "overlapping_unresolved_gaps": overlapping_gaps,
                 "older_unresolved_gaps": older_gaps,
                 "accepted_unverified_gap_count": accepted_gap_summary["count"],
                 "accepted_unverified_gaps": accepted_gap_summary["gaps"],
                 "accepted_unverified_gaps_truncated": accepted_gap_summary["truncated"],
-                "complete_for_returned_range": True,
+                "complete_for_returned_range": not overlapping_gaps,
             },
+            "warning_codes": warning_codes,
+            "roleplay_instruction": (
+                "可以根据本次上下文生成 RP。"
+                if safe_to_roleplay
+                else "这些是可能过期或不完整的缓存；不要继续推进 RP，先告知用户等待恢复。"
+            ),
             "rules": rules.health(),
+        }
+
+    @group_mcp.tool(
+        name="trpg.get_recent_messages",
+        description=(
+            "查看本固定群已入库的最近消息。默认只读本地数据库；只有用户明确要求刷新时"
+            "才设置 refresh=true，最多触发一页历史并受十分钟冷却限制。"
+        ),
+        annotations=_READ_ONLY,
+        auth=auth_check,
+        run_in_thread=False,
+    )
+    async def get_recent_messages(
+        since_message_id: Annotated[
+            str | None,
+            Field(description="可选增量游标；只返回此消息 ID 之后的已入库消息。"),
+        ] = None,
+        limit: Annotated[int, Field(description="最多返回的消息数，范围 1 到 100。")] = 20,
+        refresh: Annotated[
+            bool,
+            Field(description="是否显式请求一次受限的单页历史刷新；默认 false。"),
+        ] = False,
+    ) -> dict[str, Any]:
+        group, error = enabled_group()
+        if error:
+            return error
+        assert group is not None
+        if not 1 <= limit <= 100:
+            raise ValueError("limit 必须在 1 到 100 之间")
+        group_id = str(group["qq_group_id"])
+        refresh_result: dict[str, Any] = {
+            "requested": refresh,
+            "status": "not_requested",
+        }
+        if refresh:
+            try:
+                refresh_result = {
+                    "requested": True,
+                    **await runtime.refresh_recent_messages(group_id),
+                }
+            except Exception as refresh_error:
+                refresh_result = {
+                    "requested": True,
+                    "status": "blocked",
+                    "error": f"{type(refresh_error).__name__}: {refresh_error}"[:500],
+                }
+        if since_message_id:
+            messages = store.context_messages(
+                group_id,
+                since_message_id=since_message_id,
+                limit=limit,
+            )
+        else:
+            messages = store.recent(group_id, limit=limit)
+        roles = store.member_roles(str(group["group_key"]))
+        health = runtime.health_snapshot()
+        unresolved = store.list_message_gaps(
+            group_id=group_id,
+            unresolved_only=True,
+        )
+        safe = bool(health["safe_to_roleplay"] and not unresolved)
+        return {
+            "notice": _UNTRUSTED_NOTICE,
+            "group": _group_meta(group),
+            "messages": present(messages, roles),
+            "latest_message_id": store.latest_message_id(group_id),
+            "latest_message_at": (max((int(item["sent_at"]) for item in messages), default=None)),
+            "refresh": refresh_result,
+            "qq_online": health["qq_online"],
+            "event_connected": health["event_connected"],
+            "data_fresh": bool(health["data_fresh"] and not unresolved),
+            "safe_to_roleplay": safe,
+            "recovery_state": health["recovery_state"],
+            "unresolved_message_gaps": unresolved,
         }
 
     @group_mcp.tool(

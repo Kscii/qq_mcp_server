@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
-from qq_mcp_server.application import run_server
+from qq_mcp_server.application import run_api_server, run_collector_server, run_server
 from qq_mcp_server.config import ConfigError, default_config_text, load_config
 from qq_mcp_server.napcat import prepare_napcat_config
 from qq_mcp_server.rules import RuleIndex, RuleSource, build_rule_index
@@ -29,8 +29,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="显示调试日志")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("setup", help="交互创建最小部署配置")
-    commands.add_parser("run", help="启动纯 SSE 群消息采集和 Admin/群 MCP")
-    status = commands.add_parser("status", help="查看 AI 授权群、SSE 状态和规则索引")
+    commands.add_parser("run", help="本地单进程启动 WebSocket 采集器和 Admin/群 MCP")
+    commands.add_parser("run-api", help="只启动 Admin/群 MCP 与 WebUI")
+    commands.add_parser("run-collector", help="只启动反向 WebSocket 采集器和会话看门狗")
+    status = commands.add_parser("status", help="查看 AI 授权群、事件链路状态和规则索引")
     status.add_argument("--json", action="store_true", help="输出 JSON")
     backup = commands.add_parser("backup", help="使用 SQLite 在线备份当前数据库")
     backup.add_argument("--output-dir", type=Path, help="备份目录，默认数据库同级 backups")
@@ -71,7 +73,9 @@ def _status(path: Path, as_json: bool) -> None:
         "account_id": config.account_id,
         "database": str(config.database_path),
         "rules": RuleIndex(config.rules_database_path).health(),
+        "event_transport": store.runtime_status("event_transport"),
         "sse": store.runtime_status("sse"),
+        "session_health": store.runtime_status("session_health"),
         "message_gaps": store.list_message_gaps(unresolved_only=True),
         "onebot_actions": store.onebot_action_summary(),
         "groups": [
@@ -125,7 +129,19 @@ def main() -> None:
         if arguments.command == "setup":
             _setup(arguments.config)
         elif arguments.command == "run":
-            asyncio.run(run_server(load_config(arguments.config)))
+            config = load_config(arguments.config)
+            if os.environ.get("QQ_MCP_API_ONLY", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+            }:
+                asyncio.run(run_api_server(config))
+            else:
+                asyncio.run(run_server(config))
+        elif arguments.command == "run-api":
+            asyncio.run(run_api_server(load_config(arguments.config)))
+        elif arguments.command == "run-collector":
+            asyncio.run(run_collector_server(load_config(arguments.config)))
         elif arguments.command == "status":
             _status(arguments.config, arguments.json)
         elif arguments.command == "backup":

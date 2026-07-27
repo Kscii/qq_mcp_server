@@ -14,6 +14,32 @@ from qq_mcp_server.onebot import (
 
 
 @pytest.mark.asyncio
+async def test_status_reads_local_online_flag_without_other_actions() -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        assert json.loads(request.content) == {}
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "retcode": 0,
+                "data": {"online": False, "good": True, "stat": {}},
+            },
+        )
+
+    client = OneBotClient(
+        "http://127.0.0.1:3000",
+        "token",
+        transport=httpx.MockTransport(handler),
+    )
+    assert await client.get_status() == {"online": False, "good": True, "stat": {}}
+    assert calls == ["/get_status"]
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_history_request_is_read_only_and_disables_media_resolution() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/get_group_msg_history"

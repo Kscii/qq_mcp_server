@@ -18,8 +18,8 @@ compose() {
 
 case "$1" in
     apply-restart-policy)
-        docker update --restart=on-failure:2 qq-mcp-server-napcat >/dev/null
-        echo "✓ NapCat 已限制为连续失败最多重启 2 次；容器未重启。"
+        docker update --restart=no qq-mcp-server-napcat >/dev/null
+        echo "✓ NapCat 已禁用进程退出后的自动重启；容器未重启。"
         ;;
     initialize)
         if docker container inspect qq-mcp-server-napcat >/dev/null 2>&1; then

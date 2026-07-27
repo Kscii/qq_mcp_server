@@ -57,6 +57,7 @@ class OneBotClient:
 
     _ALLOWED_ACTIONS = frozenset(
         {
+            "get_status",
             "get_login_info",
             "get_group_info",
             "get_group_list",
@@ -165,7 +166,9 @@ class OneBotClient:
         stats = self._stats[action]
         stats["calls"] += 1
         stats["last_called_at"] = datetime.now(UTC).isoformat()
-        attempts = 3
+        # get_status 只读取 NapCat 本地 selfInfo.online。它用于安全熔断，
+        # 不需要像普通只读动作一样在本机端口不可达时快速连重三次。
+        attempts = 1 if action == "get_status" else 3
         for attempt in range(attempts):
             try:
                 response = await self._client.post(
@@ -240,6 +243,18 @@ class OneBotClient:
                 "total_latency_ms": round(float(value["total_latency_ms"]), 3),
             }
         return result
+
+    async def get_status(self) -> dict[str, Any]:
+        data = await self._action("get_status")
+        if not isinstance(data, dict):
+            raise OneBotError("get_status 返回格式错误")
+        online = data.get("online")
+        good = data.get("good")
+        return {
+            **data,
+            "online": online if isinstance(online, bool) else False,
+            "good": good if isinstance(good, bool) else True,
+        }
 
     async def get_login_info(self) -> dict[str, Any]:
         data = await self._action("get_login_info")

@@ -204,7 +204,11 @@ def _overview_context(
     group_key = str(group["group_key"])
     group_id = str(group["qq_group_id"])
     message_state = store.state(group_id)
-    sse = store.runtime_status("sse")
+    transport = store.runtime_status("event_transport")
+    if transport.get("updated_at") is None:
+        transport = store.runtime_status("sse")
+    session = store.runtime_status("session_health")
+    control = store.runtime_status("collection_control")
     unresolved_gaps = store.list_message_gaps(
         group_id=group_id,
         unresolved_only=True,
@@ -218,13 +222,16 @@ def _overview_context(
             "newest_time_display": _format_time(message_state["newest_time"], timezone),
         },
         "sse": {
-            **sse,
+            **transport,
+            "qq_online": session.get("qq_online"),
+            "recovery_state": session.get("recovery_state"),
+            "offline_reason": session.get("offline_reason"),
             "healthy": bool(
-                sse.get("connected")
-                and sse.get("online") is not False
-                and sse.get("good") is not False
+                transport.get("connected")
+                and session.get("qq_online") is True
+                and control.get("status") == "active"
             ),
-            "updated_at_display": _format_time(sse.get("updated_at"), timezone),
+            "updated_at_display": _format_time(transport.get("updated_at"), timezone),
         },
         "unresolved_gaps": unresolved_gaps,
         "character_source": (

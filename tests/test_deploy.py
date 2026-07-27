@@ -7,16 +7,18 @@ def deploy_text(name: str) -> str:
     return (Path("deploy") / name).read_text(encoding="utf-8")
 
 
-def test_routine_deploy_never_starts_or_updates_napcat() -> None:
+def test_routine_deploy_only_touches_napcat_during_first_collector_migration() -> None:
     script = deploy_text("deploy.sh")
 
     assert "compose stop app" in script
     assert "compose up -d --no-deps app" in script
     assert "compose up -d napcat" not in script
     assert "compose pull napcat" not in script
-    assert "prepare-napcat" not in script
     assert "docker restart" not in script
-    assert "docker update" not in script
+    assert 'if [ "$collector_first_install" -eq 1 ]' in script
+    assert "prepare-napcat /data/napcat/config" in script
+    assert "docker update --restart=no qq-mcp-server-napcat" in script
+    assert 'elif [ "$deploy_collector" = "1" ]' in script
 
 
 def test_first_v4_deploy_has_verified_backup_and_rollback() -> None:
@@ -48,7 +50,8 @@ def test_napcat_lifecycle_requires_explicit_maintenance() -> None:
     maintenance = deploy_text("maintain-napcat.sh")
     recovery = deploy_text("restart-napcat.sh")
 
-    assert 'restart: "on-failure:2"' in compose
+    assert 'restart: "no"' in compose
     assert "CONFIRM_NAPCAT_MAINTENANCE" in maintenance
+    assert "docker update --restart=no" in maintenance
     assert "max_restarts_per_window=2" in recovery
     assert "restart_window_seconds=86400" in recovery

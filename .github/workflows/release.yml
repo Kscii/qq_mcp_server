@@ -22,8 +22,38 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       digest: ${{ steps.image.outputs.digest }}
+      deploy_collector: ${{ steps.collector.outputs.deploy_collector }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: collector
+        name: 判断是否需要更新采集器
+        shell: bash
+        run: |
+          previous="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          if [ -z "$previous" ]; then
+            echo "deploy_collector=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --quiet "$previous" HEAD -- \
+            Dockerfile pyproject.toml uv.lock \
+            src/qq_mcp_server/application.py \
+            src/qq_mcp_server/cli.py \
+            src/qq_mcp_server/collector.py \
+            src/qq_mcp_server/config.py \
+            src/qq_mcp_server/gaps.py \
+            src/qq_mcp_server/models.py \
+            src/qq_mcp_server/normalization.py \
+            src/qq_mcp_server/onebot.py \
+            src/qq_mcp_server/runtime.py \
+            src/qq_mcp_server/store.py \
+            src/qq_mcp_server/sync.py \
+            deploy/compose.yaml deploy/config.server.toml; then
+            echo "deploy_collector=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_collector=1" >> "$GITHUB_OUTPUT"
+          fi
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.30"
@@ -81,8 +111,9 @@ jobs:
       - name: 部署不可变镜像
         env:
           DIGEST: ${{ needs.test-build-release.outputs.digest }}
+          DEPLOY_COLLECTOR: ${{ needs.test-build-release.outputs.deploy_collector }}
         run: |
           image_ref="${IMAGE}@${DIGEST}"
           gcloud compute ssh "$INSTANCE" --zone "$ZONE" \
             --tunnel-through-iap --quiet \
-            --command="sudo install -d -m 0750 /opt/qq_mcp_server && sudo tar -xzf /tmp/qq-mcp-server-deploy.tar.gz -C /opt/qq_mcp_server --strip-components=1 --no-same-owner --exclude='.env' --exclude='deploy.env' && sudo find /opt/qq_mcp_server -maxdepth 1 -type f -name '*.sh' -exec chmod 700 {} + && sudo /opt/qq_mcp_server/deploy-image.sh '$image_ref'"
+            --command="sudo install -d -m 0750 /opt/qq_mcp_server && sudo tar -xzf /tmp/qq-mcp-server-deploy.tar.gz -C /opt/qq_mcp_server --strip-components=1 --no-same-owner --exclude='.env' --exclude='deploy.env' && sudo find /opt/qq_mcp_server -maxdepth 1 -type f -name '*.sh' -exec chmod 700 {} + && sudo env DEPLOY_COLLECTOR='$DEPLOY_COLLECTOR' /opt/qq_mcp_server/deploy-image.sh '$image_ref'"

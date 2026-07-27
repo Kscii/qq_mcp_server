@@ -141,6 +141,7 @@ async def test_admin_and_group_apps_are_separate(config: AppConfig) -> None:
         "trpg.get_status",
         "trpg.open_campaign_dashboard",
         "trpg.get_roleplay_context",
+        "trpg.get_recent_messages",
         "trpg.get_character_card",
         "trpg.search_messages",
         "trpg.search_coc_rules",
@@ -167,7 +168,7 @@ async def test_all_tool_and_parameter_descriptions_are_chinese(config: AppConfig
     )
 
     tools = [*(await admin.list_tools()), *(await group_mcp.list_tools())]
-    assert len(tools) == 34
+    assert len(tools) == 35
     for tool in tools:
         assert tool.description
         assert any("\u4e00" <= character <= "\u9fff" for character in tool.description)
@@ -302,7 +303,9 @@ async def test_group_context_pages_backward_without_raising_single_call_limit(
     assert older.data["message_page"]["has_more"] is False
 
 
-async def test_group_context_refuses_unsynchronized_messages(config: AppConfig) -> None:
+async def test_group_context_returns_cached_data_with_unsafe_flag_when_offline(
+    config: AppConfig,
+) -> None:
     store = MessageStore(config.database_path)
     group = store.whitelist_group("2", "测试群")
     store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
@@ -316,10 +319,13 @@ async def test_group_context_refuses_unsynchronized_messages(config: AppConfig) 
     )
     async with Client(group_mcp) as client:
         result = await client.call_tool("trpg.get_roleplay_context", {})
-    assert result.data["error"]["code"] == "QQ_CONTEXT_STALE"
+    assert result.data["messages"] == []
+    assert result.data["collection"]["safe_to_roleplay"] is False
+    assert "EVENT_DATA_STALE" in result.data["warning_codes"]
+    assert "不要继续推进 RP" in result.data["roleplay_instruction"]
 
 
-async def test_group_context_refuses_range_overlapping_unresolved_gap(
+async def test_group_context_returns_range_with_unsafe_gap_warning(
     config: AppConfig,
 ) -> None:
     store = MessageStore(config.database_path)
@@ -346,7 +352,10 @@ async def test_group_context_refuses_range_overlapping_unresolved_gap(
     async with Client(group_mcp) as client:
         result = await client.call_tool("trpg.get_roleplay_context", {})
 
-    assert result.data["error"]["code"] == "MESSAGE_GAP_OVERLAPS_CONTEXT"
+    assert result.data["collection"]["safe_to_roleplay"] is False
+    assert result.data["collection"]["complete_for_returned_range"] is False
+    assert "MESSAGE_GAP_OVERLAPS_CONTEXT" in result.data["warning_codes"]
+    assert len(result.data["messages"]) == 2
 
 
 async def test_group_context_only_returns_accepted_gaps_overlapping_returned_range(

@@ -1049,7 +1049,8 @@ class MessageStore:
     ) -> list[dict[str, Any]]:
         source_clause = (
             " AND source IN "
-            "('sse_disconnect', 'heartbeat_degraded', 'heartbeat_timeout', "
+            "('sse_disconnect', 'event_disconnect', 'session_offline', "
+            "'onebot_unreachable', 'heartbeat_degraded', 'heartbeat_timeout', "
             "'unclean_restart', 'account_switch', 'collection_pause')"
             if automatic_only
             else ""
@@ -1285,6 +1286,44 @@ class MessageStore:
                 (cutoff,),
             ).fetchone()
         return int(row[0]) if row else 0
+
+    def onebot_action_cooldown(
+        self,
+        action: str,
+        source: str,
+        *,
+        cooldown_seconds: int,
+    ) -> dict[str, Any]:
+        if not action or len(action) > 80:
+            raise ValueError("OneBot 动作格式错误")
+        if not source or len(source) > 80:
+            raise ValueError("OneBot 调用来源格式错误")
+        if not 1 <= cooldown_seconds <= 86_400:
+            raise ValueError("OneBot 冷却必须在 1 到 86400 秒之间")
+        now = datetime.now(UTC)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT created_at FROM onebot_action_audit
+                   WHERE action = ? AND source = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (action, source),
+            ).fetchone()
+        if row is None:
+            return {
+                "allowed": True,
+                "remaining_seconds": 0,
+                "last_called_at": None,
+                "cooldown_seconds": cooldown_seconds,
+            }
+        called_at = datetime.fromisoformat(str(row["created_at"]))
+        elapsed = max(0.0, (now - called_at).total_seconds())
+        remaining = max(0, int(cooldown_seconds - elapsed + 0.999))
+        return {
+            "allowed": remaining == 0,
+            "remaining_seconds": remaining,
+            "last_called_at": called_at.isoformat(),
+            "cooldown_seconds": cooldown_seconds,
+        }
 
     @staticmethod
     def _account_from_row(row: sqlite3.Row) -> dict[str, Any]:

@@ -288,6 +288,16 @@ class MultiGroupSyncManager:
         source: str,
     ) -> dict[str, Any]:
         previous = self.store.runtime_status("collection_control")
+        if (
+            previous.get("status") == status
+            and previous.get("reason") == reason
+            and previous.get("source") == source
+        ):
+            if status == "active":
+                self._active.set()
+            else:
+                self._active.clear()
+            return previous
         value = {
             "status": status,
             "reason": reason,
@@ -313,7 +323,19 @@ class MultiGroupSyncManager:
         }
 
     def is_active(self) -> bool:
-        return self._active.is_set()
+        # API 与采集器是独立进程。数据库中的控制状态是唯一真相，
+        # 本地 Event 只用于减少同一进程内等待恢复的延迟。
+        active = self.store.runtime_status("collection_control").get("status") == "active"
+        if active:
+            self._active.set()
+        else:
+            self._active.clear()
+        return active
+
+    def allows_passive_events(self) -> bool:
+        """掉线恢复期间仍保存被动到达的事件，但尊重人工/配置暂停。"""
+        status = self.store.runtime_status("collection_control").get("status")
+        return status not in {"paused_manual", "paused_configuration"}
 
     def require_active(self) -> None:
         if not self.is_active():
@@ -323,7 +345,11 @@ class MultiGroupSyncManager:
             )
 
     async def wait_until_active(self) -> None:
-        await self._active.wait()
+        while not self.is_active():
+            try:
+                await asyncio.wait_for(self._active.wait(), timeout=1)
+            except TimeoutError:
+                continue
 
     def pause_manual(self, reason: str) -> dict[str, Any]:
         text = reason.strip()
