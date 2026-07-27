@@ -378,7 +378,7 @@ async def test_napcat_launcher_hides_token_until_confirmed_redirect(
     assert redirected.status_code == 303
     assert (
         redirected.headers["location"]
-        == "https://qq.example-tailnet.ts.net:8443/webui/web_login?token=private-webui-token"
+        == "https://qq.example-tailnet.ts.net:8443/webui?token=private-webui-token"
     )
     assert reused.status_code == 400
     assert redirected.headers["cache-control"] == "no-store"

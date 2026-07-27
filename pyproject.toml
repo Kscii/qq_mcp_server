@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "qq_mcp_server"
-version = "0.4.1"
+version = "0.4.2"
 description = "面向 COC 跑团的多群只读 QQ 同步与隔离 MCP 服务"
 readme = "README.md"
 requires-python = ">=3.12"

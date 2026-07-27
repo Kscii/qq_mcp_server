@@ -409,4 +409,4 @@ def _napcat_webui_target(config: AppConfig) -> str:
     token = str(payload.get("token") or "") if isinstance(payload, dict) else ""
     if not token or len(token) > 512:
         raise ValueError("NapCat WebUI Token 不可用")
-    return f"{config.napcat_webui_url}/web_login?{urlencode({'token': token})}"
+    return f"{config.napcat_webui_url}?{urlencode({'token': token})}"
