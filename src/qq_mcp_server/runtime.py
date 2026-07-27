@@ -635,10 +635,15 @@ class NapCatRuntime:
                     heartbeat_age = None
             interval_ms = int(sse.get("heartbeat_interval_ms") or 30_000)
             threshold = max(60.0, interval_ms * 3 / 1000)
+            # Some NapCat builds never emit heartbeat meta events. In that case
+            # the open SSE transport, rather than an absent heartbeat, is the
+            # only available health signal.
+            heartbeat_observed = heartbeat_age is not None
             stale = bool(
                 self.manager.is_active()
                 and sse.get("connected")
-                and (heartbeat_age is None or heartbeat_age > threshold)
+                and heartbeat_age is not None
+                and heartbeat_age > threshold
             )
             if stale:
                 self._open_outage(
@@ -653,6 +658,7 @@ class NapCatRuntime:
                     "heartbeat_age_seconds": (
                         round(heartbeat_age, 3) if heartbeat_age is not None else None
                     ),
+                    "heartbeat_observed": heartbeat_observed,
                     "heartbeat_timeout_seconds": threshold,
                     "heartbeat_stale": stale,
                 },

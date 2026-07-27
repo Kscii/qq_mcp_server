@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import pytest
 
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.runtime import NapCatRuntime, sync_freshness
@@ -149,6 +152,41 @@ async def test_group_registry_error_never_authorizes_napcat_restart(
     assert status["status"] == "healthy"
     assert status["onebot_reachable"] is True
     assert all("恢复 NapCat" not in action["label"] for action in status["next_actions"])
+
+
+async def test_watchdog_does_not_invent_gap_when_napcat_never_sent_heartbeat(
+    config: AppConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = MessageStore(config.database_path)
+    runtime = NapCatRuntime(
+        config,
+        RuntimeClient(),  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+    store.upsert_group_candidate("2", "测试群", source="group_message_event")
+    store.set_runtime_status(
+        "sse",
+        {
+            "connected": True,
+            "last_event_at": datetime.now(UTC).isoformat(),
+            "last_heartbeat_at": None,
+            "heartbeat_interval_ms": None,
+        },
+    )
+
+    async def stop_after_first_check(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("qq_mcp_server.runtime.asyncio.sleep", stop_after_first_check)
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.run_watchdog_forever()
+
+    watchdog = store.runtime_status("collector_watchdog")
+    assert watchdog["heartbeat_observed"] is False
+    assert watchdog["heartbeat_stale"] is False
+    assert store.list_message_gaps(group_id="2", unresolved_only=True) == []
 
 
 def test_sync_error_does_not_make_stale_state_look_fresh(config: AppConfig) -> None:
