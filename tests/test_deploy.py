@@ -21,17 +21,25 @@ def test_routine_deploy_only_touches_napcat_during_first_collector_migration() -
     assert 'elif [ "$deploy_collector" = "1" ]' in script
 
 
-def test_first_v4_deploy_has_verified_backup_and_rollback() -> None:
+def test_first_v5_deploy_has_verified_backup_and_rollback() -> None:
     deploy = deploy_text("deploy.sh")
     rollback = deploy_text("deploy-image.sh")
 
-    assert "pre-v4-backup.path" in deploy
+    assert "pre-v5-backup.path" in deploy
     assert "backup \\" in deploy
     assert "--output-dir /data/backups" in deploy
-    assert 'if [ "$migrated_schema" != "4" ]' in deploy
+    assert 'if [ "$migrated_schema" != "5" ]' in deploy
     assert "PRAGMA integrity_check" in rollback
     assert "os.replace(temporary_path, destination_path)" in rollback
     assert "SKIP_SAFETY_MIGRATION=1 ./deploy.sh" in rollback
+
+
+def test_v4_to_v5_migration_does_not_pause_or_restart_napcat() -> None:
+    deploy = deploy_text("deploy.sh")
+
+    assert '[ "$schema_version" = "4" ]' in deploy
+    assert "v4→v5 只增加归档和补偿状态" in deploy
+    assert "status --json" in deploy
 
 
 def test_account_switch_helper_uses_fixed_request_and_per_account_directory() -> None:

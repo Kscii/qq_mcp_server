@@ -81,8 +81,9 @@ qq_mcp_server prepare-napcat DIRECTORY
 `GOOGLE_OAUTH_CLIENT_ID`、`GOOGLE_OAUTH_CLIENT_SECRET`、`MCP_JWT_SIGNING_KEY` 和
 `MCP_STORAGE_ENCRYPTION_KEY`。
 
-schema v2/v3 会在首次 v0.6 部署前备份并原子升级到 schema v4，保留群、人物卡、笔记
-和消息。Dice Echo 或其他旧 SQLite 不迁移。
+schema v2/v3/v4 会在首次 v0.8 部署前备份并原子升级到 schema v5，保留群、人物卡、
+笔记和消息。v4 群按原 `roleplay_enabled` 迁移：启用群保持未归档，其余归档。
+Dice Echo 或其他旧 SQLite 不迁移。
 
 ## 首次配置群
 
@@ -96,6 +97,7 @@ schema v2/v3 会在首次 v0.6 部署前备份并原子升级到 schema v4，保
 8. 回到管理 App 启用群。
 
 所有群消息都会经反向 WebSocket 入库；访问授权只控制 AI 是否能读，启停只控制跑团工具。
+同一白名单网页还可归档或恢复群：归档保留历史只读访问，但停止 RP 和自动历史补偿。
 
 ## QQ 账号登记与切换
 

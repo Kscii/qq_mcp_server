@@ -39,7 +39,19 @@ class GapRepairService:
             raise ValueError("缺口尚未结束，不能开始历史修复")
         if gap["status"] in {"repaired", "accepted"}:
             raise ValueError("该缺口已经结束处理")
-        if self.store.history_actions_in_last_24_hours() >= self.daily_page_limit:
+        automatic_jobs = self.store.list_recovery_jobs(
+            group_id=str(gap["group_id"]),
+            active_only=True,
+            limit=20,
+        )
+        for job in automatic_jobs:
+            self.store.update_recovery_job(
+                str(job["job_id"]),
+                status="cancelled",
+                error="用户启动人工缺口修复，人工操作优先",
+            )
+        budget = self.store.history_request_budget(daily_limit=self.daily_page_limit)
+        if budget["remaining"] <= 0:
             raise ValueError("过去 24 小时历史请求已达到 30 页安全上限")
         updated = self.store.update_message_gap_repair(
             gap_id,
@@ -66,17 +78,23 @@ class GapRepairService:
             gap = self.store.refresh_message_gap_boundaries(gap_id)
             if gap["status"] != "repairing":
                 return gap
-            if self.store.history_actions_in_last_24_hours() >= self.daily_page_limit:
-                return self.store.update_message_gap_repair(
-                    gap_id,
-                    status="paused",
-                    repair_cursor=gap["repair_cursor"],
-                    error="过去 24 小时历史请求达到安全上限，需要人工恢复",
-                )
             group_id = str(gap["group_id"])
             cursor = str(gap["repair_cursor"]) if gap["repair_cursor"] else None
             if cursor is None and gap["after_message_id"]:
                 cursor = self.store.message_seq(group_id, str(gap["after_message_id"]))
+            budget = self.store.claim_history_request(
+                "manual_gap_repair",
+                daily_limit=self.daily_page_limit,
+            )
+            if not budget["allowed"]:
+                return self.store.update_message_gap_repair(
+                    gap_id,
+                    status="repairing",
+                    repair_cursor=cursor,
+                    error=(
+                        "历史请求等待安全额度；下次可请求时间 " + str(budget["next_eligible_at"])
+                    ),
+                )
             try:
                 with onebot_action_source(self.client, "manual_gap_repair"):
                     raw = await self.client.get_group_history(

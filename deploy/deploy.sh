@@ -31,7 +31,7 @@ case "$database_container_path" in
     /data/*) database_path="$data_dir/${database_container_path#/data/}" ;;
     *) echo "DATABASE_PATH 必须位于 /data 持久卷内" >&2; exit 2 ;;
 esac
-migration_marker="$data_dir/control/pre-v4-backup.path"
+migration_marker="$data_dir/control/pre-v5-backup.path"
 profile_migrated=0
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -88,7 +88,8 @@ else:
         connection.close()
 ' "$database_path"
 )"
-if { [ "$schema_version" = "2" ] || [ "$schema_version" = "3" ]; } \
+if { [ "$schema_version" = "2" ] || [ "$schema_version" = "3" ] \
+    || [ "$schema_version" = "4" ]; } \
     && [ "${SKIP_SAFETY_MIGRATION:-0}" != "1" ]; then
     # 旧进程不会动态读取新写入的暂停状态，所以迁移前只停止应用。
     # NapCat 的容器、登录目录和会话均不在应用发布链中。
@@ -108,12 +109,12 @@ if { [ "$schema_version" = "2" ] || [ "$schema_version" = "3" ]; } \
             backup_path="$data_dir/${backup_container_path#/data/}"
             ;;
         *)
-            echo "无法确认 v2/v3 数据库备份路径，拒绝迁移" >&2
+            echo "无法确认 schema v2/v3/v4 数据库备份路径，拒绝迁移" >&2
             exit 1
             ;;
     esac
     if [ ! -f "$backup_path" ]; then
-        echo "v2/v3 数据库备份不存在：$backup_path" >&2
+        echo "schema v2/v3/v4 数据库备份不存在：$backup_path" >&2
         exit 1
     fi
     control_dir="$(dirname "$migration_marker")"
@@ -125,8 +126,13 @@ if { [ "$schema_version" = "2" ] || [ "$schema_version" = "3" ]; } \
     fi
     printf '%s\n' "$backup_path" >"$migration_marker"
     chmod 0600 "$migration_marker"
-    compose run --rm --no-deps app -c /config/config.toml pause-collection \
-        --reason "v0.6 纯 SSE 与多账号升级：等待人工确认账号后恢复"
+    if [ "$schema_version" = "2" ] || [ "$schema_version" = "3" ]; then
+        compose run --rm --no-deps app -c /config/config.toml pause-collection \
+            --reason "v0.6 纯 SSE 与多账号升级：等待人工确认账号后恢复"
+    else
+        # v4→v5 只增加归档和补偿状态；不重启 NapCat，也不暂停当前 QQ 会话。
+        compose run --rm --no-deps app -c /config/config.toml status --json >/dev/null
+    fi
     migrated_schema="$(
         python3 -c '
 import sqlite3, sys
@@ -140,8 +146,8 @@ finally:
     connection.close()
 ' "$database_path"
     )"
-    if [ "$migrated_schema" != "4" ]; then
-        echo "数据库未完成 v4 迁移，拒绝启动新应用" >&2
+    if [ "$migrated_schema" != "5" ]; then
+        echo "数据库未完成 v5 迁移，拒绝启动新应用" >&2
         exit 1
     fi
     compose run --rm --no-deps app -c /config/config.toml status --json >/dev/null

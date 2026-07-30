@@ -45,7 +45,7 @@ def backup_database(path: Path, directory: Path) -> Path:
     target_directory = directory.expanduser().resolve()
     target_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    target = target_directory / f"{source_path.stem}.pre-v4.{timestamp}.sqlite3"
+    target = target_directory / f"{source_path.stem}.pre-v5.{timestamp}.sqlite3"
     with (
         closing(sqlite3.connect(source_path)) as source,
         closing(sqlite3.connect(target)) as destination,
@@ -195,7 +195,7 @@ class MessageStore:
                     "SELECT value FROM app_metadata WHERE key = 'schema_version'"
                 ).fetchone()
                 schema_version = str(schema[0]) if schema else None
-                if schema_version not in {"2", "3", "4"}:
+                if schema_version not in {"2", "3", "4", "5"}:
                     raise ValueError("数据库 schema_version 不受支持；请使用新的 database 路径")
             connection.executescript(
                 """
@@ -205,7 +205,7 @@ class MessageStore:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
-                INSERT OR IGNORE INTO app_metadata(key, value) VALUES ('schema_version', '4');
+                INSERT OR IGNORE INTO app_metadata(key, value) VALUES ('schema_version', '5');
 
                 CREATE TABLE IF NOT EXISTS groups (
                     group_key TEXT PRIMARY KEY,
@@ -217,6 +217,12 @@ class MessageStore:
                     history_since TEXT,
                     roleplay_enabled INTEGER NOT NULL DEFAULT 0,
                     whitelisted INTEGER NOT NULL DEFAULT 1,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    archived_at TEXT,
+                    archive_reason TEXT,
+                    archive_source TEXT,
+                    membership_status TEXT NOT NULL DEFAULT 'joined',
+                    membership_updated_at TEXT,
                     version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -339,6 +345,39 @@ class MessageStore:
                 CREATE INDEX IF NOT EXISTS idx_message_gaps_group_time
                     ON message_gaps (group_id, start_at, status);
 
+                CREATE TABLE IF NOT EXISTS history_request_slots (
+                    slot_id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_history_request_slots_time
+                    ON history_request_slots (claimed_at);
+
+                CREATE TABLE IF NOT EXISTS recovery_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    session_generation INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN (
+                            'queued', 'repairing', 'waiting_budget',
+                            'paused_error', 'complete', 'unverified', 'cancelled'
+                        )),
+                    cursor TEXT,
+                    target_start_at INTEGER NOT NULL,
+                    after_boundary_seen INTEGER NOT NULL DEFAULT 0,
+                    pages_attempted INTEGER NOT NULL DEFAULT 0,
+                    inserted_count INTEGER NOT NULL DEFAULT 0,
+                    rebase_count INTEGER NOT NULL DEFAULT 0,
+                    next_eligible_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (group_id, session_generation)
+                );
+                CREATE INDEX IF NOT EXISTS idx_recovery_jobs_status
+                    ON recovery_jobs (status, updated_at);
+
                 CREATE TABLE IF NOT EXISTS onebot_action_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -460,6 +499,60 @@ class MessageStore:
                 connection.execute(
                     "UPDATE app_metadata SET value = '4' WHERE key = 'schema_version'"
                 )
+                schema_version = "4"
+            if schema_version == "4":
+                group_columns = {
+                    str(row[1]) for row in connection.execute("PRAGMA table_info(groups)")
+                }
+                additions = {
+                    "archived": "INTEGER NOT NULL DEFAULT 0",
+                    "archived_at": "TEXT",
+                    "archive_reason": "TEXT",
+                    "archive_source": "TEXT",
+                    "membership_status": "TEXT NOT NULL DEFAULT 'joined'",
+                    "membership_updated_at": "TEXT",
+                }
+                for column, declaration in additions.items():
+                    if column not in group_columns:
+                        connection.execute(f"ALTER TABLE groups ADD COLUMN {column} {declaration}")
+                migrated_at = _utc_now()
+                connection.execute(
+                    """UPDATE groups
+                       SET archived = CASE WHEN roleplay_enabled = 1 THEN 0 ELSE 1 END,
+                           archived_at = CASE
+                               WHEN roleplay_enabled = 1 THEN NULL ELSE ?
+                           END,
+                           archive_reason = CASE
+                               WHEN roleplay_enabled = 1 THEN NULL
+                               ELSE '升级时按原跑团开关自动归档'
+                           END,
+                           archive_source = CASE
+                               WHEN roleplay_enabled = 1 THEN NULL ELSE 'migration'
+                           END,
+                           membership_status = 'joined',
+                           membership_updated_at = ?""",
+                    (migrated_at, migrated_at),
+                )
+                connection.execute(
+                    """UPDATE message_gaps
+                       SET repair_cursor = NULL,
+                           status = CASE
+                               WHEN status = 'repairing' THEN 'paused' ELSE status
+                           END,
+                           last_error = CASE
+                               WHEN repair_cursor IS NOT NULL
+                               THEN 'legacy_cursor_untrusted：升级后将从最新页安全重新定位'
+                               ELSE last_error
+                           END"""
+                )
+                connection.execute(
+                    "UPDATE app_metadata SET value = '5' WHERE key = 'schema_version'"
+                )
+            connection.execute(
+                """INSERT OR IGNORE INTO app_metadata(key, value)
+                   VALUES ('history_budget_started_at', ?)""",
+                (_utc_now(),),
+            )
             connection.commit()
         self.path.chmod(0o600)
 
@@ -476,6 +569,7 @@ class MessageStore:
         result = dict(row)
         result["roleplay_enabled"] = bool(result["roleplay_enabled"])
         result["whitelisted"] = bool(result["whitelisted"])
+        result["archived"] = bool(result["archived"])
         return result
 
     def list_groups(self, *, whitelisted_only: bool = True) -> list[dict[str, Any]]:
@@ -495,6 +589,18 @@ class MessageStore:
                 history_since=str(row["history_since"]) if row["history_since"] else None,
             )
             for row in self.list_groups()
+        ]
+
+    def recovery_targets(self) -> list[GroupTarget]:
+        return [
+            GroupTarget(
+                group_key=str(row["group_key"]),
+                group_id=str(row["qq_group_id"]),
+                group_name=str(row["qq_group_name"]),
+                history_since=str(row["history_since"]) if row["history_since"] else None,
+            )
+            for row in self.list_groups()
+            if not row["archived"]
         ]
 
     def get_group(self, group_key: str, *, require_whitelisted: bool = True) -> dict[str, Any]:
@@ -522,9 +628,13 @@ class MessageStore:
         with closing(self._connect()) as connection, connection:
             if existing:
                 connection.execute(
-                    """UPDATE groups SET whitelisted = 1, qq_group_name = ?, updated_at = ?
+                    """UPDATE groups SET whitelisted = 1, archived = 0,
+                              archived_at = NULL, archive_reason = NULL,
+                              archive_source = NULL, qq_group_name = ?,
+                              membership_status = 'joined',
+                              membership_updated_at = ?, updated_at = ?
                        WHERE qq_group_id = ?""",
-                    (name, now, group_id),
+                    (name, now, now, group_id),
                 )
                 group_key = str(existing["group_key"])
             else:
@@ -551,13 +661,118 @@ class MessageStore:
                 (now, group_key),
             )
 
+    def set_group_archived(
+        self,
+        group_key: str,
+        *,
+        archived: bool,
+        reason: str,
+        source: str,
+    ) -> dict[str, Any]:
+        group = self.get_group(group_key)
+        text = reason.strip()
+        origin = source.strip()
+        if not text:
+            raise ValueError("归档原因不能为空")
+        if origin not in {"manual", "membership_event", "migration"}:
+            raise ValueError("归档来源无效")
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """UPDATE groups SET archived = ?,
+                          archived_at = CASE WHEN ? = 1 THEN ? ELSE NULL END,
+                          archive_reason = CASE WHEN ? = 1 THEN ? ELSE NULL END,
+                          archive_source = CASE WHEN ? = 1 THEN ? ELSE NULL END,
+                          roleplay_enabled = CASE WHEN ? = 1 THEN 0 ELSE roleplay_enabled END,
+                          version = version + 1, updated_at = ?
+                   WHERE group_key = ? AND whitelisted = 1""",
+                (
+                    int(archived),
+                    int(archived),
+                    now,
+                    int(archived),
+                    text[:500],
+                    int(archived),
+                    origin,
+                    int(archived),
+                    now,
+                    group_key,
+                ),
+            )
+            if archived:
+                connection.execute(
+                    """UPDATE recovery_jobs SET status = 'cancelled',
+                              cursor = NULL, next_eligible_at = NULL,
+                              last_error = '群已归档', updated_at = ?
+                       WHERE group_id = ?
+                         AND status IN ('queued', 'repairing', 'waiting_budget')""",
+                    (now, str(group["qq_group_id"])),
+                )
+        return self.get_group(group_key)
+
+    def update_group_membership(
+        self,
+        group_id: str,
+        *,
+        status: str,
+        reason: str,
+        automatic_archive: bool,
+    ) -> dict[str, Any] | None:
+        if status not in {"joined", "left", "kicked", "disbanded", "uncertain"}:
+            raise ValueError("群成员状态无效")
+        group = self.get_group_by_qq(group_id)
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """UPDATE groups SET membership_status = ?,
+                          membership_updated_at = ?, updated_at = ?
+                   WHERE qq_group_id = ?""",
+                (status, now, now, group_id),
+            )
+            if group and automatic_archive and group["whitelisted"]:
+                connection.execute(
+                    """UPDATE groups SET archived = 1, archived_at = ?,
+                              archive_reason = ?, archive_source = 'membership_event',
+                              roleplay_enabled = 0, version = version + 1,
+                              updated_at = ?
+                       WHERE qq_group_id = ?""",
+                    (now, reason.strip()[:500], now, group_id),
+                )
+                connection.execute(
+                    """UPDATE recovery_jobs SET status = 'cancelled',
+                              cursor = NULL, next_eligible_at = NULL,
+                              last_error = '账号已不在群内', updated_at = ?
+                       WHERE group_id = ?
+                         AND status IN ('queued', 'repairing', 'waiting_budget')""",
+                    (now, group_id),
+                )
+            elif (
+                group
+                and status == "joined"
+                and group["whitelisted"]
+                and group["archived"]
+                and group.get("archive_source") == "membership_event"
+            ):
+                connection.execute(
+                    """UPDATE groups SET archived = 0, archived_at = NULL,
+                              archive_reason = NULL, archive_source = NULL,
+                              version = version + 1, updated_at = ?
+                       WHERE qq_group_id = ?""",
+                    (now, group_id),
+                )
+        return self.get_group_by_qq(group_id)
+
     @staticmethod
     def _expect_version(connection: sqlite3.Connection, group_key: str, expected: int) -> int:
         row = connection.execute(
-            "SELECT version FROM groups WHERE group_key = ? AND whitelisted = 1", (group_key,)
+            """SELECT version, archived FROM groups
+               WHERE group_key = ? AND whitelisted = 1""",
+            (group_key,),
         ).fetchone()
         if row is None:
             raise KeyError("群尚未授权 AI 访问")
+        if bool(row["archived"]):
+            raise ValueError("GROUP_ARCHIVED：归档群只允许读取；请先在群访问网页恢复")
         current = int(row[0])
         if current != expected:
             raise VersionConflictError(current)
@@ -688,6 +903,9 @@ class MessageStore:
     def set_group_enabled(
         self, group_key: str, *, expected_version: int, enabled: bool
     ) -> dict[str, Any]:
+        group = self.get_group(group_key)
+        if enabled and group["archived"]:
+            raise ValueError("归档群不能启用跑团；请先在群访问网页恢复该群")
         with closing(self._connect()) as connection, connection:
             self._expect_version(connection, group_key, expected_version)
             connection.execute(
@@ -1278,14 +1496,344 @@ class MessageStore:
         return result
 
     def history_actions_in_last_24_hours(self) -> int:
-        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+        return int(self.history_request_budget()["used"])
+
+    @staticmethod
+    def _history_request_times(
+        connection: sqlite3.Connection,
+        *,
+        cutoff: str,
+        budget_started_at: str,
+    ) -> list[str]:
+        audited = connection.execute(
+            """SELECT created_at FROM onebot_action_audit
+               WHERE action = 'get_group_msg_history'
+                 AND created_at >= ? AND created_at < ?""",
+            (cutoff, budget_started_at),
+        ).fetchall()
+        claimed = connection.execute(
+            """SELECT claimed_at FROM history_request_slots
+               WHERE claimed_at >= ?""",
+            (cutoff,),
+        ).fetchall()
+        return sorted([str(row[0]) for row in audited] + [str(row[0]) for row in claimed])
+
+    def history_request_budget(
+        self,
+        *,
+        now: datetime | None = None,
+        minimum_interval_seconds: int = 60,
+        daily_limit: int = 30,
+    ) -> dict[str, Any]:
+        current = now or datetime.now(UTC)
+        cutoff = (current - timedelta(hours=24)).isoformat()
+        with closing(self._connect()) as connection:
+            started = connection.execute(
+                "SELECT value FROM app_metadata WHERE key = 'history_budget_started_at'"
+            ).fetchone()
+            budget_started_at = str(started[0]) if started else current.isoformat()
+            times = self._history_request_times(
+                connection,
+                cutoff=cutoff,
+                budget_started_at=budget_started_at,
+            )
+        next_times: list[datetime] = []
+        if times:
+            next_times.append(
+                datetime.fromisoformat(times[-1]) + timedelta(seconds=minimum_interval_seconds)
+            )
+        if len(times) >= daily_limit:
+            next_times.append(datetime.fromisoformat(times[-daily_limit]) + timedelta(hours=24))
+        next_eligible = max(next_times) if next_times else current
+        allowed = len(times) < daily_limit and next_eligible <= current
+        reason = None
+        if len(times) >= daily_limit:
+            reason = "daily_limit"
+        elif next_eligible > current:
+            reason = "minimum_interval"
+        return {
+            "allowed": allowed,
+            "reason": reason,
+            "used": len(times),
+            "remaining": max(0, daily_limit - len(times)),
+            "daily_limit": daily_limit,
+            "minimum_interval_seconds": minimum_interval_seconds,
+            "next_eligible_at": next_eligible.isoformat(),
+        }
+
+    def claim_history_request(
+        self,
+        source: str,
+        *,
+        now: datetime | None = None,
+        minimum_interval_seconds: int = 60,
+        daily_limit: int = 30,
+    ) -> dict[str, Any]:
+        origin = source.strip()[:80]
+        if not origin:
+            raise ValueError("历史请求来源不能为空")
+        current = now or datetime.now(UTC)
+        cutoff = (current - timedelta(hours=24)).isoformat()
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            started = connection.execute(
+                "SELECT value FROM app_metadata WHERE key = 'history_budget_started_at'"
+            ).fetchone()
+            budget_started_at = str(started[0]) if started else current.isoformat()
+            times = self._history_request_times(
+                connection,
+                cutoff=cutoff,
+                budget_started_at=budget_started_at,
+            )
+            next_times: list[datetime] = []
+            if times:
+                next_times.append(
+                    datetime.fromisoformat(times[-1]) + timedelta(seconds=minimum_interval_seconds)
+                )
+            if len(times) >= daily_limit:
+                next_times.append(datetime.fromisoformat(times[-daily_limit]) + timedelta(hours=24))
+            next_eligible = max(next_times) if next_times else current
+            allowed = len(times) < daily_limit and next_eligible <= current
+            if allowed:
+                slot_id = f"hist_{secrets.token_urlsafe(12)}"
+                connection.execute(
+                    """INSERT INTO history_request_slots(slot_id, source, claimed_at)
+                       VALUES (?, ?, ?)""",
+                    (slot_id, origin, current.isoformat()),
+                )
+                connection.execute(
+                    "DELETE FROM history_request_slots WHERE claimed_at < ?",
+                    ((current - timedelta(days=30)).isoformat(),),
+                )
+            connection.commit()
+        reason = None
+        if len(times) >= daily_limit:
+            reason = "daily_limit"
+        elif next_eligible > current:
+            reason = "minimum_interval"
+        return {
+            "allowed": allowed,
+            "reason": reason,
+            "used": len(times) + int(allowed),
+            "remaining": max(0, daily_limit - len(times) - int(allowed)),
+            "daily_limit": daily_limit,
+            "minimum_interval_seconds": minimum_interval_seconds,
+            "next_eligible_at": (
+                (current + timedelta(seconds=minimum_interval_seconds)).isoformat()
+                if allowed
+                else next_eligible.isoformat()
+            ),
+        }
+
+    @staticmethod
+    def _recovery_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["session_generation"] = int(result["session_generation"])
+        result["target_start_at"] = int(result["target_start_at"])
+        result["after_boundary_seen"] = bool(result["after_boundary_seen"])
+        result["pages_attempted"] = int(result["pages_attempted"])
+        result["inserted_count"] = int(result["inserted_count"])
+        result["rebase_count"] = int(result["rebase_count"])
+        return result
+
+    def enqueue_recovery_jobs(
+        self,
+        *,
+        account_id: str,
+        session_generation: int,
+    ) -> list[dict[str, Any]]:
+        now = _utc_now()
+        created: list[str] = []
+        with closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                """SELECT groups.qq_group_id AS group_id,
+                          min(message_gaps.start_at) AS target_start_at
+                   FROM groups
+                   JOIN message_gaps ON message_gaps.group_id = groups.qq_group_id
+                   WHERE groups.whitelisted = 1 AND groups.archived = 0
+                     AND message_gaps.confidence = 'confirmed'
+                     AND message_gaps.end_at IS NOT NULL
+                     AND message_gaps.status NOT IN ('repaired', 'accepted')
+                   GROUP BY groups.qq_group_id"""
+            ).fetchall()
+            for row in rows:
+                group_id = str(row["group_id"])
+                connection.execute(
+                    """UPDATE recovery_jobs SET status = 'cancelled',
+                              cursor = NULL, next_eligible_at = NULL,
+                              last_error = 'QQ 登录会话已经变化', updated_at = ?
+                       WHERE group_id = ? AND session_generation != ?
+                         AND status IN ('queued', 'repairing', 'waiting_budget')""",
+                    (now, group_id, session_generation),
+                )
+                job_id = f"recovery_{secrets.token_urlsafe(12)}"
+                connection.execute(
+                    """INSERT INTO recovery_jobs (
+                           job_id, group_id, account_id, session_generation,
+                           status, target_start_at, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+                       ON CONFLICT(group_id, session_generation) DO UPDATE SET
+                           target_start_at = min(
+                               recovery_jobs.target_start_at,
+                               excluded.target_start_at
+                           ),
+                           status = CASE
+                               WHEN recovery_jobs.status = 'complete'
+                               THEN 'queued' ELSE recovery_jobs.status
+                           END,
+                           updated_at = excluded.updated_at""",
+                    (
+                        job_id,
+                        group_id,
+                        account_id,
+                        session_generation,
+                        int(row["target_start_at"]),
+                        now,
+                        now,
+                    ),
+                )
+                selected = connection.execute(
+                    """SELECT job_id FROM recovery_jobs
+                       WHERE group_id = ? AND session_generation = ?""",
+                    (group_id, session_generation),
+                ).fetchone()
+                assert selected is not None
+                created.append(str(selected[0]))
+        return [self.recovery_job(job_id) for job_id in created]
+
+    def invalidate_history_cursors_for_new_session(self) -> None:
+        now = _utc_now()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """UPDATE sync_state SET reconcile_cursor = NULL,
+                          reconcile_boundary_id = NULL, reconcile_newest_id = NULL,
+                          last_error = CASE
+                              WHEN reconcile_cursor IS NOT NULL
+                              THEN 'QQ 会话已变化；最近同步将从最新页重新定位'
+                              ELSE last_error
+                          END"""
+            )
+            connection.execute(
+                """UPDATE message_gaps SET repair_cursor = NULL,
+                          status = CASE
+                              WHEN status = 'repairing' THEN 'paused' ELSE status
+                          END,
+                          last_error = CASE
+                              WHEN repair_cursor IS NOT NULL
+                              THEN 'QQ 会话已变化；旧分页游标已丢弃'
+                              ELSE last_error
+                          END,
+                          updated_at = ?
+                   WHERE status NOT IN ('repaired', 'accepted')""",
+                (now,),
+            )
+
+    def recovery_job(self, job_id: str) -> dict[str, Any]:
         with closing(self._connect()) as connection:
             row = connection.execute(
-                """SELECT count(*) FROM onebot_action_audit
-                   WHERE action = 'get_group_msg_history' AND created_at >= ?""",
-                (cutoff,),
+                "SELECT * FROM recovery_jobs WHERE job_id = ?", (job_id,)
             ).fetchone()
-        return int(row[0]) if row else 0
+        if row is None:
+            raise KeyError("自动补偿任务不存在")
+        return self._recovery_job_from_row(row)
+
+    def list_recovery_jobs(
+        self,
+        *,
+        group_id: str | None = None,
+        active_only: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        parameters: list[object] = []
+        if group_id is not None:
+            clauses.append("group_id = ?")
+            parameters.append(group_id)
+        if active_only:
+            clauses.append("status IN ('queued', 'repairing', 'waiting_budget')")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit)
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                f"""SELECT * FROM recovery_jobs {where}
+                    ORDER BY updated_at DESC LIMIT ?""",
+                parameters,
+            ).fetchall()
+        return [self._recovery_job_from_row(row) for row in rows]
+
+    def next_recovery_job(
+        self,
+        *,
+        account_id: str,
+        session_generation: int,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        current = (now or datetime.now(UTC)).isoformat()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """SELECT jobs.* FROM recovery_jobs AS jobs
+                   JOIN groups ON groups.qq_group_id = jobs.group_id
+                   WHERE jobs.account_id = ? AND jobs.session_generation = ?
+                     AND jobs.status IN ('queued', 'repairing', 'waiting_budget')
+                     AND (jobs.next_eligible_at IS NULL OR jobs.next_eligible_at <= ?)
+                     AND groups.whitelisted = 1 AND groups.archived = 0
+                   ORDER BY jobs.updated_at, jobs.created_at LIMIT 1""",
+                (account_id, session_generation, current),
+            ).fetchone()
+        return self._recovery_job_from_row(row) if row else None
+
+    def update_recovery_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        cursor: str | None = None,
+        after_boundary_seen: bool | None = None,
+        increment_pages: bool = False,
+        inserted: int = 0,
+        increment_rebase: bool = False,
+        next_eligible_at: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {
+            "queued",
+            "repairing",
+            "waiting_budget",
+            "paused_error",
+            "complete",
+            "unverified",
+            "cancelled",
+        }:
+            raise ValueError("自动补偿任务状态无效")
+        current = self.recovery_job(job_id)
+        seen = (
+            int(after_boundary_seen)
+            if after_boundary_seen is not None
+            else int(current["after_boundary_seen"])
+        )
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """UPDATE recovery_jobs SET status = ?, cursor = ?,
+                          after_boundary_seen = ?,
+                          pages_attempted = pages_attempted + ?,
+                          inserted_count = inserted_count + ?,
+                          rebase_count = rebase_count + ?,
+                          next_eligible_at = ?, last_error = ?, updated_at = ?
+                   WHERE job_id = ?""",
+                (
+                    status,
+                    cursor,
+                    seen,
+                    int(increment_pages),
+                    max(0, inserted),
+                    int(increment_rebase),
+                    next_eligible_at,
+                    error[:500] if error else None,
+                    _utc_now(),
+                    job_id,
+                ),
+            )
+        return self.recovery_job(job_id)
 
     def onebot_action_cooldown(
         self,
@@ -1883,10 +2431,14 @@ class MessageStore:
         now = _utc_now()
         with closing(self._connect()) as connection, connection:
             row = connection.execute(
-                "SELECT version FROM groups WHERE group_key = ? AND whitelisted = 1", (group_key,)
+                """SELECT version, archived FROM groups
+                   WHERE group_key = ? AND whitelisted = 1""",
+                (group_key,),
             ).fetchone()
             if row is None:
                 raise KeyError("群尚未授权 AI 访问")
+            if bool(row["archived"]):
+                raise ValueError("GROUP_ARCHIVED：归档群只允许读取；请先在群访问网页恢复")
             connection.execute(
                 """INSERT INTO characters (
                        group_key, source_filename, source_sha256, source_path,

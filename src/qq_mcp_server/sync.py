@@ -29,6 +29,17 @@ class CollectionPausedError(RuntimeError):
     pass
 
 
+class HistoryBudgetUnavailable(RuntimeError):
+    def __init__(self, budget: dict[str, Any]) -> None:
+        self.budget = budget
+        reason = (
+            "过去 24 小时历史请求已达到安全上限"
+            if budget.get("reason") == "daily_limit"
+            else "历史请求全局冷却中"
+        )
+        super().__init__(f"{reason}；下次可请求时间 {budget.get('next_eligible_at')}")
+
+
 def _iso_now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -55,6 +66,9 @@ class SyncService:
         client: OneBotClient,
         store: MessageStore,
         limiter: asyncio.Semaphore | None = None,
+        *,
+        history_budgeted: bool = False,
+        history_source: str = "sync_service",
     ) -> None:
         self.config = config
         self.target = target
@@ -62,6 +76,8 @@ class SyncService:
         self.store = store
         self.since_timestamp = _parse_since(target.history_since or config.history_since)
         self.limiter = limiter or asyncio.Semaphore(1)
+        self.history_budgeted = history_budgeted
+        self.history_source = history_source
 
     async def verify_login(self) -> dict[str, Any]:
         async with self.limiter:
@@ -83,6 +99,10 @@ class SyncService:
         return login
 
     async def _history(self, cursor: str | None) -> list[dict[str, Any]]:
+        if self.history_budgeted:
+            budget = self.store.claim_history_request(self.history_source)
+            if not budget["allowed"]:
+                raise HistoryBudgetUnavailable(budget)
         async with self.limiter:
             return await self.client.get_group_history(
                 self.target.group_id,
@@ -426,6 +446,8 @@ class MultiGroupSyncManager:
                 self.client,
                 self.store,
                 self.limiter,
+                history_budgeted=True,
+                history_source=f"sync_cycle_recent:{target.group_id}",
             )
             result = await service.sync_recent_page()
             recent_results.append(
@@ -455,6 +477,8 @@ class MultiGroupSyncManager:
                 self.client,
                 self.store,
                 self.limiter,
+                history_budgeted=True,
+                history_source=f"sync_cycle_backfill:{target.group_id}",
             )
             result = await service.backfill_one_page()
             backfill_results.append(

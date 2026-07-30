@@ -90,6 +90,39 @@ async def test_whitelist_web_page_and_group_route_guard(config: AppConfig) -> No
     assert store.get_group_by_qq("2") is not None
 
 
+async def test_whitelist_web_page_archives_and_restores_existing_group(
+    config: AppConfig,
+) -> None:
+    store, _, _, app = services(config)
+    group = store.whitelist_group("2", "测试群")
+    transport = httpx.ASGITransport(app=app)
+
+    archive_token = store.issue_capability(
+        kind="group_access", group_key=None, issued_to="local", ttl_seconds=600
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        page = await client.get(f"/admin/groups/{archive_token}")
+        archived = await client.post(
+            f"/admin/groups/{archive_token}",
+            data={"action": "archive", "group_key": str(group["group_key"])},
+        )
+    assert "测试群" in page.text
+    assert "未归档" in page.text
+    assert "已归档" in archived.text
+    assert store.get_group(str(group["group_key"]))["archived"] is True
+
+    restore_token = store.issue_capability(
+        kind="group_access", group_key=None, issued_to="local", ttl_seconds=600
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        restored = await client.post(
+            f"/admin/groups/{restore_token}",
+            data={"action": "restore", "group_key": str(group["group_key"])},
+        )
+    assert "已恢复" in restored.text
+    assert store.get_group(str(group["group_key"]))["archived"] is False
+
+
 async def test_character_upload_preview_and_confirm(
     config: AppConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -129,6 +162,29 @@ async def test_character_upload_preview_and_confirm(
     character = store.character(str(group["group_key"]))
     assert character is not None
     assert character["current"]["identity"]["name"] == "调查员"
+
+
+async def test_archived_group_rejects_character_upload(config: AppConfig) -> None:
+    store, _, _, app = services(config)
+    group = store.whitelist_group("2", "测试群")
+    store.set_group_archived(
+        str(group["group_key"]),
+        archived=True,
+        reason="结团",
+        source="manual",
+    )
+    token = store.issue_capability(
+        kind="character_card",
+        group_key=str(group["group_key"]),
+        issued_to="local",
+        ttl_seconds=600,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        result = await client.get(f"/uploads/character-card/{token}")
+
+    assert result.status_code == 400
+    assert "GROUP_ARCHIVED" in result.text
 
 
 async def test_campaign_dashboard_renders_all_read_only_sections_and_escapes_html(

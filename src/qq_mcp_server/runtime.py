@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from qq_mcp_server.config import AppConfig
-from qq_mcp_server.normalization import normalize_message
+from qq_mcp_server.normalization import normalize_message, oldest_cursor
 from qq_mcp_server.onebot import (
     OneBotClient,
     OneBotConfigurationError,
@@ -23,6 +23,7 @@ from qq_mcp_server.store import MessageStore
 from qq_mcp_server.sync import (
     AccountMismatchError,
     CollectionPausedError,
+    HistoryBudgetUnavailable,
     MultiGroupSyncManager,
     SyncService,
 )
@@ -93,6 +94,7 @@ class NapCatRuntime:
         self._sse_transport = sse_transport
         self._registry_lock = asyncio.Lock()
         self._session_id: str | None = None
+        self._recovery_bootstrapped = False
         self.store.ensure_active_qq_account(config.account_id)
         abandoned = self.store.close_abandoned_collector_session() if collector_owner else None
         if abandoned is not None:
@@ -382,9 +384,17 @@ class NapCatRuntime:
                     "group_id": group["qq_group_id"],
                     "group_name": group["qq_group_name"],
                     "ai_access_enabled": bool(group["whitelisted"]),
+                    "archived": group["archived"],
+                    "archived_at": group["archived_at"],
+                    "archive_reason": group["archive_reason"],
+                    "membership_status": group["membership_status"],
                     "message_count": state["message_count"],
                     "newest_message_at": state["newest_time"],
                     "unresolved_gap_count": len(gaps),
+                    "automatic_history_recovery": self.store.list_recovery_jobs(
+                        group_id=str(group["qq_group_id"]),
+                        limit=5,
+                    ),
                 }
             )
         if control.get("status") == "paused_session":
@@ -460,6 +470,8 @@ class NapCatRuntime:
             "accounts": self.store.list_qq_accounts(),
             "latest_account_switch": self.store.latest_qq_account_switch(),
             "onebot_action_audit": self.store.onebot_action_summary(),
+            "history_request_budget": self.store.history_request_budget(),
+            "automatic_history_recovery": self.store.list_recovery_jobs(limit=100),
             "unresolved_message_gaps": unresolved_gaps,
             "groups": group_status,
             "next_actions": next_actions,
@@ -586,8 +598,43 @@ class NapCatRuntime:
                 group_name,
                 source="group_increase_event",
             )
-        elif notice_type == "group_decrease" and user_id == self.config.account_id:
+            updated_group = self.store.update_group_membership(
+                group_id,
+                status="joined",
+                reason="当前账号重新加入群聊",
+                automatic_archive=False,
+            )
+            health = self.store.runtime_status("session_health")
+            generation = int(health.get("session_generation") or 0)
+            if updated_group and not updated_group["archived"] and generation > 0:
+                self.store.enqueue_recovery_jobs(
+                    account_id=self.config.account_id,
+                    session_generation=generation,
+                )
+        elif notice_type == "group_decrease":
+            subtype = str(event.get("sub_type") or "")
+            affects_self = user_id == self.config.account_id or subtype in {
+                "kick_me",
+                "disband",
+            }
+            if not affects_self:
+                return
             self.store.mark_group_candidate_unavailable(group_id, source="group_decrease_event")
+            membership = {
+                "leave": "left",
+                "kick": "kicked",
+                "kick_me": "kicked",
+                "disband": "disbanded",
+            }.get(subtype, "uncertain")
+            explicit = subtype in {"leave", "kick_me", "disband"} or (
+                subtype == "kick" and user_id == self.config.account_id
+            )
+            self.store.update_group_membership(
+                group_id,
+                status=membership,
+                reason=(f"收到当前账号的群成员减少事件：{subtype or '未注明子类型'}"),
+                automatic_archive=explicit,
+            )
 
     def _begin_sse_session(self) -> None:
         session = self.store.start_collector_session(self.config.account_id)
@@ -807,42 +854,114 @@ class NapCatRuntime:
         *,
         recovery_key: str,
     ) -> dict[str, Any]:
-        enabled = [group for group in self.store.list_groups() if group["roleplay_enabled"]]
-        if not enabled:
-            return {"status": "skipped", "reason": "没有启用的跑团群"}
-        if self.store.history_actions_in_last_24_hours() >= 30:
-            return {"status": "skipped", "reason": "历史请求已达到 24 小时安全上限"}
-        group = enabled[0]
-        group_id = str(group["qq_group_id"])
-        target = next(
-            (item for item in self.store.sync_targets() if item.group_id == group_id),
-            None,
+        current = self.store.runtime_status("session_health")
+        generation = int(current.get("session_generation") or 0) + 1
+        self.store.invalidate_history_cursors_for_new_session()
+        jobs = self.store.enqueue_recovery_jobs(
+            account_id=self.config.account_id,
+            session_generation=generation,
         )
-        if target is None:
-            return {"status": "skipped", "reason": "找不到同步目标"}
-        source = f"automatic_login_recovery:{group_id}"
         self._write_session_health(
+            session_generation=generation,
             recovery_history_attempted_for=recovery_key,
             recovery_history_attempted_at=_iso_now(),
         )
-        try:
-            service = SyncService(
-                self.config,
-                target,
-                self.client,
-                self.store,
-                self.manager.limiter,
+        return {
+            "status": "queued" if jobs else "skipped",
+            "reason": None if jobs else "没有白名单且未归档群的已确认缺口",
+            "session_generation": generation,
+            "job_ids": [str(job["job_id"]) for job in jobs],
+            "gap_ids": [str(gap["gap_id"]) for gap in gaps],
+        }
+
+    async def _automatic_history_recovery_tick(self) -> dict[str, Any]:
+        health = self.store.runtime_status("session_health")
+        if (
+            not self.manager.is_active()
+            or health.get("qq_online") is not True
+            or health.get("recovery_state") not in {None, "active"}
+        ):
+            return {"status": "skipped", "reason": "QQ 会话尚未安全就绪"}
+        generation = int(health.get("session_generation") or 0)
+        if generation <= 0:
+            generation = 1
+            self._write_session_health(session_generation=generation)
+        if not self._recovery_bootstrapped:
+            self.store.enqueue_recovery_jobs(
+                account_id=self.config.account_id,
+                session_generation=generation,
             )
-            with onebot_action_source(self.client, source):
-                result = await service.sync_recent_page()
+            self._recovery_bootstrapped = True
+        job = self.store.next_recovery_job(
+            account_id=self.config.account_id,
+            session_generation=generation,
+        )
+        if job is None:
+            return {"status": "idle", "session_generation": generation}
+        job_id = str(job["job_id"])
+        group_id = str(job["group_id"])
+        group = self.store.get_group_by_qq(group_id)
+        if group is None or not group["whitelisted"] or group["archived"]:
+            updated = self.store.update_recovery_job(
+                job_id,
+                status="cancelled",
+                error="群未授权或已经归档",
+            )
+            return {"status": "cancelled", "job": updated}
+        source = f"automatic_login_recovery:{group_id}"
+        budget = self.store.claim_history_request(source)
+        if not budget["allowed"]:
+            updated = self.store.update_recovery_job(
+                job_id,
+                status="waiting_budget",
+                cursor=str(job["cursor"]) if job["cursor"] else None,
+                next_eligible_at=str(budget["next_eligible_at"]),
+                error=(
+                    "等待 24 小时历史额度"
+                    if budget["reason"] == "daily_limit"
+                    else "等待历史请求全局冷却"
+                ),
+            )
+            return {"status": "waiting_budget", "job": updated, "budget": budget}
+        cursor = str(job["cursor"]) if job["cursor"] else None
+        try:
+            async with self.manager.limiter:
+                with onebot_action_source(self.client, source):
+                    raw = await self.client.get_group_history(
+                        group_id,
+                        self.config.page_size,
+                        message_seq=cursor,
+                    )
+            messages = []
+            for item in raw:
+                message = normalize_message(item, expected_group_id=group_id)
+                if message is not None:
+                    messages.append(message)
+            _received, inserted = self.store.upsert(messages)
+            raw_ids = {str(item.get("message_id") or "") for item in raw}
+            gaps = [
+                gap
+                for gap in self.store.list_message_gaps(
+                    group_id=group_id,
+                    unresolved_only=True,
+                )
+                if gap["confidence"] == "confirmed" and gap["end_at"] is not None
+            ]
+            newest_time = max(
+                (int(item.get("time") or 0) for item in raw),
+                default=0,
+            )
+            newest_gap_end = max((int(gap["end_at"]) for gap in gaps), default=0)
+            after_seen = bool(
+                job["after_boundary_seen"]
+                or (cursor is None and raw and newest_time >= newest_gap_end)
+            )
             repaired: list[str] = []
-            unresolved: list[str] = []
             for original in gaps:
-                if str(original["group_id"]) != group_id:
-                    continue
                 refreshed = self.store.refresh_message_gap_boundaries(str(original["gap_id"]))
-                has_before_boundary = bool(refreshed.get("before_message_id"))
-                if result.boundary_found and has_before_boundary:
+                before_id = str(refreshed.get("before_message_id") or "")
+                after_id = str(refreshed.get("after_message_id") or "")
+                if after_seen and before_id and after_id and before_id in raw_ids:
                     self.store.update_message_gap_repair(
                         str(refreshed["gap_id"]),
                         status="repaired",
@@ -852,33 +971,109 @@ class NapCatRuntime:
                 else:
                     self.store.update_message_gap_repair(
                         str(refreshed["gap_id"]),
-                        status="paused",
+                        status="repairing",
+                        repair_cursor=None,
                         increment_pages=True,
-                        error="登录恢复只允许单页补偿，未验证已知边界",
+                        error=None,
                     )
-                    unresolved.append(str(refreshed["gap_id"]))
+            remaining = [
+                gap
+                for gap in self.store.list_message_gaps(
+                    group_id=group_id,
+                    unresolved_only=True,
+                )
+                if gap["confidence"] == "confirmed" and gap["end_at"] is not None
+            ]
+            next_cursor = oldest_cursor(raw)
+            exhausted = not raw or not next_cursor or next_cursor == cursor
+            if not remaining:
+                updated = self.store.update_recovery_job(
+                    job_id,
+                    status="complete",
+                    cursor=None,
+                    after_boundary_seen=after_seen,
+                    increment_pages=True,
+                    inserted=inserted,
+                )
+                status = "complete"
+            elif exhausted:
+                for gap in remaining:
+                    self.store.update_message_gap_repair(
+                        str(gap["gap_id"]),
+                        status="unverified",
+                        error="历史接口已经耗尽，未能验证缺口前后边界",
+                    )
+                updated = self.store.update_recovery_job(
+                    job_id,
+                    status="unverified",
+                    cursor=None,
+                    after_boundary_seen=after_seen,
+                    increment_pages=True,
+                    inserted=inserted,
+                    error="历史接口已经耗尽，仍有缺口未验证",
+                )
+                status = "unverified"
+            else:
+                updated = self.store.update_recovery_job(
+                    job_id,
+                    status="repairing",
+                    cursor=next_cursor,
+                    after_boundary_seen=after_seen,
+                    increment_pages=True,
+                    inserted=inserted,
+                    next_eligible_at=str(budget["next_eligible_at"]),
+                )
+                status = "repairing"
             return {
-                "status": "completed",
+                "status": status,
                 "group_id": group_id,
-                "received": result.received,
-                "inserted": result.inserted,
-                "boundary_found": result.boundary_found,
+                "received": len(raw),
+                "inserted": inserted,
                 "repaired_gap_ids": repaired,
-                "unresolved_gap_ids": unresolved,
+                "job": updated,
+                "budget": budget,
             }
         except Exception as error:
-            for original in gaps:
-                if str(original["group_id"]) == group_id:
-                    self.store.update_message_gap_repair(
-                        str(original["gap_id"]),
-                        status="paused",
-                        increment_pages=True,
-                        error=f"自动单页补偿失败：{type(error).__name__}: {error}",
-                    )
+            text = f"{type(error).__name__}: {error}"[:500]
+            cursor_invalid = "不存在" in str(error) and cursor is not None
+            if cursor_invalid and int(job["rebase_count"]) < 1:
+                updated = self.store.update_recovery_job(
+                    job_id,
+                    status="queued",
+                    cursor=None,
+                    increment_pages=True,
+                    increment_rebase=True,
+                    next_eligible_at=str(budget["next_eligible_at"]),
+                    error="当前会话分页游标失效；下一请求槽从最新页重新定位一次",
+                )
+                status = "rebasing"
+            else:
+                updated = self.store.update_recovery_job(
+                    job_id,
+                    status="paused_error",
+                    cursor=None,
+                    increment_pages=True,
+                    error=text,
+                )
+                status = "paused_error"
+                for gap in self.store.list_message_gaps(
+                    group_id=group_id,
+                    unresolved_only=True,
+                ):
+                    if gap["confidence"] == "confirmed" and gap["end_at"] is not None:
+                        self.store.update_message_gap_repair(
+                            str(gap["gap_id"]),
+                            status="paused",
+                            error=f"自动补偿已暂停：{text}",
+                        )
+            if isinstance(error, OneBotSessionError):
+                self.manager.pause_session(error, source="automatic_history_recovery")
             return {
-                "status": "failed",
+                "status": status,
                 "group_id": group_id,
-                "error": f"{type(error).__name__}: {error}"[:500],
+                "error": text,
+                "job": updated,
+                "budget": budget,
             }
 
     async def _check_session_status(self, now: datetime) -> None:
@@ -1050,8 +1245,6 @@ class NapCatRuntime:
         )
         if not cooldown["allowed"]:
             raise RuntimeError(f"该群历史刷新冷却中，请等待 {cooldown['remaining_seconds']} 秒")
-        if self.store.history_actions_in_last_24_hours() >= 30:
-            raise RuntimeError("过去 24 小时历史请求已达到 30 页安全上限")
         target = next(
             (item for item in self.store.sync_targets() if item.group_id == group_id),
             None,
@@ -1064,10 +1257,14 @@ class NapCatRuntime:
             self.client,
             self.store,
             self.manager.limiter,
+            history_budgeted=True,
+            history_source=source,
         )
         try:
             with onebot_action_source(self.client, source):
                 result = await service.sync_recent_page()
+        except HistoryBudgetUnavailable:
+            raise
         except OneBotSessionError as error:
             self.manager.pause_session(error, source="explicit_recent_refresh")
             raise
@@ -1113,6 +1310,20 @@ class NapCatRuntime:
                 },
             )
             await self._check_session_status(now)
+            try:
+                recovery = await self._automatic_history_recovery_tick()
+                self.store.set_runtime_status("automatic_history_recovery", recovery)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOGGER.warning("自动历史补偿调度失败：%s", error)
+                self.store.set_runtime_status(
+                    "automatic_history_recovery",
+                    {
+                        "status": "scheduler_error",
+                        "error": f"{type(error).__name__}: {error}"[:500],
+                    },
+                )
             await asyncio.sleep(STATUS_CHECK_INTERVAL_SECONDS)
 
     def pause_collection(self, reason: str, *, source: str = "admin_mcp") -> dict[str, Any]:

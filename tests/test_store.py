@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -23,7 +24,7 @@ def test_old_database_is_rejected_instead_of_partially_migrated(tmp_path) -> Non
         MessageStore(path)
 
 
-def test_schema_v2_is_atomically_migrated_to_v4(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_schema_v2_is_atomically_migrated_to_v5(tmp_path) -> None:  # type: ignore[no-untyped-def]
     path = tmp_path / "v2.sqlite3"
     connection = sqlite3.connect(path)
     connection.executescript(
@@ -63,10 +64,18 @@ def test_schema_v2_is_atomically_migrated_to_v4(tmp_path) -> None:  # type: igno
     migrated = sqlite3.connect(path)
     assert migrated.execute(
         "SELECT value FROM app_metadata WHERE key = 'schema_version'"
-    ).fetchone() == ("4",)
+    ).fetchone() == ("5",)
     group_columns = {row[1] for row in migrated.execute("PRAGMA table_info(groups)")}
     sync_columns = {row[1] for row in migrated.execute("PRAGMA table_info(sync_state)")}
     assert "history_since" in group_columns
+    assert {
+        "archived",
+        "archived_at",
+        "archive_reason",
+        "archive_source",
+        "membership_status",
+        "membership_updated_at",
+    } <= group_columns
     assert {
         "reconcile_cursor",
         "reconcile_boundary_id",
@@ -81,8 +90,32 @@ def test_schema_v2_is_atomically_migrated_to_v4(tmp_path) -> None:  # type: igno
         "onebot_action_audit",
         "qq_accounts",
         "qq_account_switches",
+        "history_request_slots",
+        "recovery_jobs",
     } <= tables
     migrated.close()
+
+
+def test_v4_to_v5_migration_archives_groups_by_roleplay_switch(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    active = store.whitelist_group("2", "当前团")
+    inactive = store.whitelist_group("3", "旧团")
+    store.set_group_enabled(str(active["group_key"]), expected_version=0, enabled=True)
+    connection = sqlite3.connect(config.database_path)
+    connection.execute("UPDATE app_metadata SET value = '4' WHERE key = 'schema_version'")
+    connection.execute(
+        """UPDATE groups SET archived = 0, archived_at = NULL,
+                  archive_reason = NULL, archive_source = NULL"""
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = MessageStore(config.database_path)
+
+    assert migrated.get_group(str(active["group_key"]))["archived"] is False
+    migrated_inactive = migrated.get_group(str(inactive["group_key"]))
+    assert migrated_inactive["archived"] is True
+    assert migrated_inactive["archive_source"] == "migration"
 
 
 def test_online_backup_is_integrity_checked_and_private(config) -> None:  # type: ignore[no-untyped-def]
@@ -159,6 +192,90 @@ def test_whitelist_removal_revokes_access_but_preserves_messages(config) -> None
     assert store.list_groups() == []
     restored = store.whitelist_group("2", "测试群新名")
     assert restored["group_key"] == group["group_key"]
+
+
+def test_archive_is_reversible_read_only_state(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    archived = store.set_group_archived(
+        str(group["group_key"]),
+        archived=True,
+        reason="结团",
+        source="manual",
+    )
+
+    assert archived["archived"] is True
+    assert archived["roleplay_enabled"] is False
+    assert archived["whitelisted"] is True
+    assert archived["archive_source"] == "manual"
+    with pytest.raises(ValueError, match="GROUP_ARCHIVED"):
+        store.update_group_profile(
+            str(group["group_key"]),
+            expected_version=int(archived["version"]),
+            module_title="不能修改",
+            display_label=None,
+            roleplay_guidance=None,
+        )
+
+    restored = store.set_group_archived(
+        str(group["group_key"]),
+        archived=False,
+        reason="重新开团",
+        source="manual",
+    )
+    assert restored["archived"] is False
+    assert restored["roleplay_enabled"] is False
+
+
+def test_membership_event_only_reopens_automatic_archive(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.update_group_membership(
+        "2",
+        status="kicked",
+        reason="被踢",
+        automatic_archive=True,
+    )
+    assert store.get_group(str(group["group_key"]))["archived"] is True
+
+    store.update_group_membership(
+        "2",
+        status="joined",
+        reason="重新入群",
+        automatic_archive=False,
+    )
+    restored = store.get_group(str(group["group_key"]))
+    assert restored["archived"] is False
+    assert restored["membership_status"] == "joined"
+
+    store.set_group_archived(
+        str(group["group_key"]),
+        archived=True,
+        reason="手动结团",
+        source="manual",
+    )
+    store.update_group_membership(
+        "2",
+        status="joined",
+        reason="仍在群里",
+        automatic_archive=False,
+    )
+    assert store.get_group(str(group["group_key"]))["archived"] is True
+
+
+def test_history_request_budget_is_atomic_and_rolling(config) -> None:  # type: ignore[no-untyped-def]
+    store = MessageStore(config.database_path)
+    started = datetime.now(UTC) + timedelta(seconds=1)
+
+    first = store.claim_history_request("test", now=started)
+    cooling = store.claim_history_request("test", now=started + timedelta(seconds=59))
+    second = store.claim_history_request("test", now=started + timedelta(seconds=60))
+
+    assert first["allowed"] is True
+    assert cooling["allowed"] is False
+    assert cooling["reason"] == "minimum_interval"
+    assert second["allowed"] is True
+    assert store.history_request_budget(now=started + timedelta(seconds=60))["used"] == 2
 
 
 def test_atomic_card_and_note_commit_then_whole_undo(config) -> None:  # type: ignore[no-untyped-def]

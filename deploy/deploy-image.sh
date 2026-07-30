@@ -36,7 +36,7 @@ case "$database_container_path" in
     /data/*) database_path="$data_dir/${database_container_path#/data/}" ;;
     *) echo "DATABASE_PATH 必须位于 /data 持久卷内" >&2; exit 2 ;;
 esac
-migration_marker="$data_dir/control/pre-v4-backup.path"
+migration_marker="$data_dir/control/pre-v5-backup.path"
 printf 'APP_IMAGE=%s\nCOLLECTOR_IMAGE=%s\n' "$1" "$collector_image" > deploy.env
 chmod 600 deploy.env
 

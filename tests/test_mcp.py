@@ -227,6 +227,50 @@ async def test_disabled_group_reports_action_while_status_still_works(config: Ap
     assert context.data["error"]["code"] == "GROUP_DISABLED"
 
 
+async def test_archived_group_keeps_history_read_only(config: AppConfig) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.upsert([message("1", "归档前消息")])
+    archived = store.set_group_archived(
+        str(group["group_key"]),
+        archived=True,
+        reason="结团",
+        source="manual",
+    )
+    _, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    async with Client(group_mcp) as client:
+        status = await client.call_tool("trpg.get_status", {})
+        context = await client.call_tool("trpg.get_roleplay_context", {})
+        recent = await client.call_tool("trpg.get_recent_messages", {})
+        upload = await client.call_tool("trpg.begin_character_card_upload", {})
+        commit = await client.call_tool(
+            "trpg.commit_turn_updates",
+            {
+                "expected_version": archived["version"],
+                "origin": "user_request",
+                "summary": "不应写入",
+                "card_operations": [],
+                "note_operations": [],
+            },
+        )
+
+    assert status.data["group"]["archived"] is True
+    assert context.data["messages"][0]["plain_text"] == "归档前消息"
+    assert context.data["collection"]["safe_to_roleplay"] is False
+    assert "GROUP_ARCHIVED" in context.data["warning_codes"]
+    assert recent.data["messages"][0]["plain_text"] == "归档前消息"
+    assert upload.data["error"]["code"] == "GROUP_ARCHIVED"
+    assert commit.data["error"]["code"] == "GROUP_ARCHIVED"
+
+
 async def test_group_context_is_fixed_and_marks_untrusted_messages(config: AppConfig) -> None:
     store = MessageStore(config.database_path)
     group = store.whitelist_group("2", "测试群")
@@ -356,6 +400,39 @@ async def test_group_context_returns_range_with_unsafe_gap_warning(
     assert result.data["collection"]["complete_for_returned_range"] is False
     assert "MESSAGE_GAP_OVERLAPS_CONTEXT" in result.data["warning_codes"]
     assert len(result.data["messages"]) == 2
+
+
+async def test_old_gap_warns_without_blocking_fresh_roleplay_context(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    store.upsert([message("100", "较早消息"), message("200", "最新消息")])
+    store.create_message_gap(
+        "2",
+        start_at=1,
+        end_at=2,
+        confidence="confirmed",
+        source="session_offline",
+    )
+    store.set_group_enabled(str(group["group_key"]), expected_version=0, enabled=True)
+    store.set_runtime_status("sse", {"connected": True, "online": True, "good": True})
+    _, group_mcp = create_mcp_servers(
+        config,
+        store,
+        FakeOneBot(),  # type: ignore[arg-type]
+        RuleIndex(config.rules_database_path),
+        CharacterCardService(store, config.card_storage_dir),
+        group_key_override=str(group["group_key"]),
+    )
+
+    async with Client(group_mcp) as client:
+        result = await client.call_tool("trpg.get_roleplay_context", {"limit": 1})
+
+    assert result.data["collection"]["safe_to_roleplay"] is True
+    assert result.data["collection"]["complete_for_returned_range"] is True
+    assert "UNRESOLVED_HISTORY_GAP" in result.data["warning_codes"]
+    assert "不得把旧历史视为完整" in result.data["roleplay_instruction"]
 
 
 async def test_group_context_only_returns_accepted_gaps_overlapping_returned_range(

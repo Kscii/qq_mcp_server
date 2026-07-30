@@ -12,10 +12,18 @@ from qq_mcp_server.store import MessageStore
 
 
 class RuntimeClient:
-    def __init__(self, *, listed: bool = False, online: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        listed: bool = False,
+        online: bool = True,
+        history: dict[str | None, list[dict[str, Any]]] | None = None,
+    ) -> None:
         self.listed = listed
         self.online = online
+        self.history = history or {}
         self.actions: list[str] = []
+        self.history_cursors: list[str | None] = []
 
     async def get_login_info(self) -> dict[str, Any]:
         self.actions.append("get_login_info")
@@ -51,7 +59,8 @@ class RuntimeClient:
         self, group_id: str, count: int, *, message_seq: str | None = None
     ) -> list[dict[str, Any]]:
         self.actions.append("get_group_history")
-        return []
+        self.history_cursors.append(message_seq)
+        return self.history.get(message_seq, [])[:count]
 
 
 def group_event(message_id: str = "10", *, group_id: str = "2") -> dict[str, Any]:
@@ -254,6 +263,143 @@ async def test_recovery_waits_five_minutes_then_verifies_once(config: AppConfig)
     assert store.runtime_status("collection_control")["status"] == "active"
     assert store.runtime_status("session_health")["recovery_state"] == "active"
     assert client.actions == ["get_status", "get_status", "get_login_info"]
+
+
+async def test_explicit_self_kick_archives_but_ambiguous_event_does_not(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    explicit_group = store.whitelist_group("2", "明确退出群")
+    ambiguous_group = store.whitelist_group("3", "不确定群")
+    runtime = NapCatRuntime(
+        config,
+        RuntimeClient(),  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+
+    await runtime.handle_event(
+        {
+            "time": 10,
+            "self_id": "1",
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": "kick_me",
+            "group_id": "2",
+            "user_id": "1",
+        }
+    )
+    await runtime.handle_event(
+        {
+            "time": 11,
+            "self_id": "1",
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "group_id": "3",
+            "user_id": "1",
+        }
+    )
+
+    explicit = store.get_group(str(explicit_group["group_key"]))
+    ambiguous = store.get_group(str(ambiguous_group["group_key"]))
+    assert explicit["archived"] is True
+    assert explicit["membership_status"] == "kicked"
+    assert ambiguous["archived"] is False
+    assert ambiguous["membership_status"] == "uncertain"
+
+
+async def test_automatic_recovery_uses_current_session_cursor_and_repairs_gap(
+    config: AppConfig,
+) -> None:
+    before = group_event("100")
+    before["time"] = 100
+    after = group_event("200")
+    after["time"] = 200
+    missing = group_event("150")
+    missing["time"] = 150
+    client = RuntimeClient(history={None: [after, missing, before]})
+    store = MessageStore(config.database_path)
+    group = store.whitelist_group("2", "测试群")
+    runtime = NapCatRuntime(
+        config,
+        client,  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+    await runtime.handle_event(before)
+    await runtime.handle_event(after)
+    gap = store.create_message_gap(
+        "2",
+        start_at=110,
+        end_at=190,
+        confidence="confirmed",
+        source="session_offline",
+    )
+    store.set_runtime_status(
+        "session_health",
+        {
+            "qq_online": True,
+            "recovery_state": "active",
+            "session_generation": 2,
+        },
+    )
+
+    result = await runtime._automatic_history_recovery_tick()
+
+    assert result["status"] == "complete"
+    assert client.history_cursors == [None]
+    assert store.message_gap(str(gap["gap_id"]))["status"] == "repaired"
+    assert store.state("2")["message_count"] == 3
+    jobs = store.list_recovery_jobs(group_id="2")
+    assert jobs[0]["session_generation"] == 2
+    assert jobs[0]["cursor"] is None
+    assert group["archived"] is False
+
+
+async def test_verified_relogin_discards_all_legacy_history_cursors(
+    config: AppConfig,
+) -> None:
+    store = MessageStore(config.database_path)
+    store.whitelist_group("2", "测试群")
+    gap = store.create_message_gap(
+        "2",
+        start_at=100,
+        end_at=200,
+        confidence="confirmed",
+        source="session_offline",
+    )
+    store.update_message_gap_repair(
+        str(gap["gap_id"]),
+        status="paused",
+        repair_cursor="348582019",
+    )
+    store.update_state(
+        account_id="1",
+        group_id="2",
+        reconcile_cursor="348582019",
+        reconcile_boundary_id="old-boundary",
+        reconcile_newest_id="old-newest",
+    )
+    runtime = NapCatRuntime(
+        config,
+        RuntimeClient(),  # type: ignore[arg-type]
+        store,
+        "token",
+    )
+
+    result = await runtime._automatic_history_recovery(
+        [gap],
+        recovery_key="new-login",
+    )
+
+    state = store.state("2")
+    refreshed_gap = store.message_gap(str(gap["gap_id"]))
+    assert result["status"] == "queued"
+    assert state["reconcile_cursor"] is None
+    assert state["reconcile_boundary_id"] is None
+    assert state["reconcile_newest_id"] is None
+    assert refreshed_gap["repair_cursor"] is None
+    assert "旧分页游标已丢弃" in refreshed_gap["last_error"]
 
 
 def test_sync_error_does_not_make_stale_state_look_fresh(config: AppConfig) -> None:

@@ -424,6 +424,12 @@ def _group_meta(group: dict[str, Any]) -> dict[str, Any]:
         "qq_group_name": group["qq_group_name"],
         "module_title": group["module_title"] or None,
         "display_label": group["display_label"] or None,
+        "archived": group["archived"],
+        "archived_at": group["archived_at"],
+        "archive_reason": group["archive_reason"],
+        "archive_source": group["archive_source"],
+        "membership_status": group["membership_status"],
+        "membership_updated_at": group["membership_updated_at"],
     }
 
 
@@ -1104,10 +1110,17 @@ def create_mcp_servers(
                     "group_mcp_url": f"{config.public_url or f'http://127.0.0.1:{config.port}'}/mcp/groups/{group['group_key']}",
                     "ready_to_enable": setup["ready_to_enable"],
                     "message_state": setup["message_state"],
+                    "automatic_history_recovery": store.list_recovery_jobs(
+                        group_id=str(group["qq_group_id"]),
+                        limit=5,
+                    ),
                     "next_actions": setup["next_actions"],
                 }
             )
-        return {"groups": result}
+        return {
+            "groups": result,
+            "history_request_budget": store.history_request_budget(),
+        }
 
     @admin.tool(
         name="admin.get_group_setup",
@@ -1145,6 +1158,11 @@ def create_mcp_servers(
         if not 1 <= limit <= 200:
             raise ValueError("limit 必须在 1 到 200 之间")
         group = store.get_group(group_key)
+        if group["archived"]:
+            return _error(
+                "GROUP_ARCHIVED",
+                "归档群不会主动查询 QQ 成员列表；只能读取已经保存的历史。",
+            )
         runtime.manager.require_active()
         source = f"manual_group_member_list:{group['qq_group_id']}"
         cooldown = store.onebot_action_cooldown(
@@ -1199,6 +1217,12 @@ def create_mcp_servers(
             ),
         ] = None,
     ) -> dict[str, Any]:
+        existing = store.get_group(group_key)
+        if existing["archived"]:
+            return _error(
+                "GROUP_ARCHIVED",
+                "归档群只允许读取；请先在群访问网页恢复后再修改配置。",
+            )
         try:
             group = store.update_group_profile(
                 group_key,
@@ -1245,6 +1269,11 @@ def create_mcp_servers(
         ] = None,
     ) -> dict[str, Any]:
         group = store.get_group(group_key)
+        if group["archived"]:
+            return _error(
+                "GROUP_ARCHIVED",
+                "归档群不会主动查询 QQ 成员，也不能修改成员身份配置。",
+            )
         runtime.manager.require_active()
         source = f"manual_member_role_setup:{group['qq_group_id']}"
         cooldown = store.onebot_action_cooldown(
@@ -1322,6 +1351,11 @@ def create_mcp_servers(
         enabled: Annotated[bool, Field(description="true 表示启用跑团，false 表示停用。")],
     ) -> dict[str, Any]:
         group = store.get_group(group_key)
+        if group["archived"]:
+            return _error(
+                "GROUP_ARCHIVED",
+                "归档群不能启用或修改跑团状态；请先在群访问网页恢复。",
+            )
         if enabled:
             setup = _readiness(store, rules, group)
             if not setup["ready_to_enable"]:
@@ -1347,6 +1381,11 @@ def create_mcp_servers(
 
     def enabled_group() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         group = selected_group()
+        if group["archived"]:
+            return None, _error(
+                "GROUP_ARCHIVED",
+                "该群已经归档，只允许读取已保存的历史；请在群访问网页恢复后再继续 RP。",
+            )
         if not group["roleplay_enabled"]:
             return None, _error(
                 "GROUP_DISABLED",
@@ -1359,6 +1398,12 @@ def create_mcp_servers(
                 ],
             )
         return group, None
+
+    def historical_group() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        group = selected_group()
+        if group["archived"]:
+            return group, None
+        return enabled_group()
 
     @group_mcp.tool(
         name="trpg.get_status",
@@ -1381,9 +1426,14 @@ def create_mcp_servers(
             "qq_online": health["qq_online"],
             "event_connected": health["event_connected"],
             "data_fresh": health["data_fresh"],
-            "safe_to_roleplay": health["safe_to_roleplay"],
+            "safe_to_roleplay": bool(health["safe_to_roleplay"] and not group["archived"]),
             "recovery_state": health["recovery_state"],
             "offline_reason": health["offline_reason"],
+            "automatic_history_recovery": store.list_recovery_jobs(
+                group_id=str(group["qq_group_id"]),
+                limit=10,
+            ),
+            "history_request_budget": store.history_request_budget(),
             **_readiness(store, rules, group),
             "message_state": state,
             "event_transport": health["event_transport"],
@@ -1441,7 +1491,7 @@ def create_mcp_servers(
         ] = None,
         limit: Annotated[int, Field(description="最多返回的消息数，范围 1 到 100。")] = 30,
     ) -> dict[str, Any]:
-        group, error = enabled_group()
+        group, error = historical_group()
         if error:
             return error
         assert group is not None
@@ -1496,6 +1546,15 @@ def create_mcp_servers(
         )
         character = store.character(group_key)
         warning_codes: list[str] = []
+        recovery_jobs = store.list_recovery_jobs(group_id=group_id, limit=10)
+        active_recovery = next(
+            (
+                job
+                for job in recovery_jobs
+                if job["status"] in {"queued", "repairing", "waiting_budget"}
+            ),
+            None,
+        )
         if not health["qq_online"]:
             warning_codes.append("QQ_OFFLINE")
         if not health["event_connected"] or not health["data_fresh"]:
@@ -1504,7 +1563,19 @@ def create_mcp_servers(
             warning_codes.append("COLLECTION_PAUSED")
         if overlapping_gaps:
             warning_codes.append("MESSAGE_GAP_OVERLAPS_CONTEXT")
-        safe_to_roleplay = bool(health["safe_to_roleplay"] and not overlapping_gaps)
+        if older_gaps:
+            warning_codes.append("UNRESOLVED_HISTORY_GAP")
+        if active_recovery:
+            warning_codes.append(
+                "HISTORY_RECOVERY_WAITING_BUDGET"
+                if active_recovery["status"] == "waiting_budget"
+                else "HISTORY_RECOVERY_RUNNING"
+            )
+        if group["archived"]:
+            warning_codes.append("GROUP_ARCHIVED")
+        safe_to_roleplay = bool(
+            health["safe_to_roleplay"] and not overlapping_gaps and not group["archived"]
+        )
         return {
             "notice": _UNTRUSTED_NOTICE,
             "prompt_version": PROMPT_VERSION,
@@ -1552,12 +1623,22 @@ def create_mcp_servers(
                 "accepted_unverified_gaps": accepted_gap_summary["gaps"],
                 "accepted_unverified_gaps_truncated": accepted_gap_summary["truncated"],
                 "complete_for_returned_range": not overlapping_gaps,
+                "automatic_history_recovery": recovery_jobs,
+                "history_request_budget": store.history_request_budget(),
             },
             "warning_codes": warning_codes,
             "roleplay_instruction": (
-                "可以根据本次上下文生成 RP。"
+                (
+                    "当前实时上下文可用于 RP；较早缺口仍在补偿，不得把旧历史视为完整。"
+                    if older_gaps or active_recovery
+                    else "可以根据本次上下文生成 RP。"
+                )
                 if safe_to_roleplay
-                else "这些是可能过期或不完整的缓存；不要继续推进 RP，先告知用户等待恢复。"
+                else (
+                    "该群已归档，只能回顾历史，不能继续推进 RP。"
+                    if group["archived"]
+                    else "这些是可能过期或不完整的缓存；不要继续推进 RP，先告知用户等待恢复。"
+                )
             ),
             "rules": rules.health(),
         }
@@ -1583,7 +1664,7 @@ def create_mcp_servers(
             Field(description="是否显式请求一次受限的单页历史刷新；默认 false。"),
         ] = False,
     ) -> dict[str, Any]:
-        group, error = enabled_group()
+        group, error = historical_group()
         if error:
             return error
         assert group is not None
@@ -1594,7 +1675,13 @@ def create_mcp_servers(
             "requested": refresh,
             "status": "not_requested",
         }
-        if refresh:
+        if refresh and group["archived"]:
+            refresh_result = {
+                "requested": True,
+                "status": "blocked",
+                "error": "GROUP_ARCHIVED：归档群不会主动读取 QQ 历史",
+            }
+        elif refresh:
             try:
                 refresh_result = {
                     "requested": True,
@@ -1620,7 +1707,12 @@ def create_mcp_servers(
             group_id=group_id,
             unresolved_only=True,
         )
-        safe = bool(health["safe_to_roleplay"] and not unresolved)
+        returned_start = min((int(item["sent_at"]) for item in messages), default=0)
+        overlapping = [
+            gap for gap in unresolved if int(gap["end_at"] or gap["start_at"]) >= returned_start
+        ]
+        recovery_jobs = store.list_recovery_jobs(group_id=group_id, limit=10)
+        safe = bool(health["safe_to_roleplay"] and not overlapping and not group["archived"])
         return {
             "notice": _UNTRUSTED_NOTICE,
             "group": _group_meta(group),
@@ -1630,10 +1722,30 @@ def create_mcp_servers(
             "refresh": refresh_result,
             "qq_online": health["qq_online"],
             "event_connected": health["event_connected"],
-            "data_fresh": bool(health["data_fresh"] and not unresolved),
+            "data_fresh": bool(health["data_fresh"] and not overlapping),
             "safe_to_roleplay": safe,
             "recovery_state": health["recovery_state"],
             "unresolved_message_gaps": unresolved,
+            "automatic_history_recovery": recovery_jobs,
+            "history_request_budget": store.history_request_budget(),
+            "warning_codes": [
+                *(["GROUP_ARCHIVED"] if group["archived"] else []),
+                *(
+                    ["MESSAGE_GAP_OVERLAPS_CONTEXT"]
+                    if overlapping
+                    else ["UNRESOLVED_HISTORY_GAP"]
+                    if unresolved
+                    else []
+                ),
+                *(
+                    ["HISTORY_RECOVERY_RUNNING"]
+                    if any(
+                        job["status"] in {"queued", "repairing", "waiting_budget"}
+                        for job in recovery_jobs
+                    )
+                    else []
+                ),
+            ],
         }
 
     @group_mcp.tool(
@@ -1693,7 +1805,7 @@ def create_mcp_servers(
         ] = None,
         limit: Annotated[int, Field(description="最多返回的消息数，范围 1 到 50。")] = 20,
     ) -> dict[str, Any]:
-        group, error = enabled_group()
+        group, error = historical_group()
         if error:
             return error
         assert group is not None
@@ -1759,6 +1871,11 @@ def create_mcp_servers(
     )
     async def begin_character_card_upload() -> dict[str, Any]:
         group = selected_group()
+        if group["archived"]:
+            return _error(
+                "GROUP_ARCHIVED",
+                "归档群只允许读取，不能上传或替换人物卡；请先在群访问网页恢复。",
+            )
         token = store.issue_capability(
             kind="character_card",
             group_key=str(group["group_key"]),
@@ -1849,7 +1966,7 @@ def create_mcp_servers(
             str | None, Field(description="可选分页游标，只返回此 change_id 之前的变更。")
         ] = None,
     ) -> dict[str, Any]:
-        group, error = enabled_group()
+        group, error = historical_group()
         if error:
             return error
         assert group is not None

@@ -105,6 +105,38 @@ def register_web_routes(
                         f"已撤销 AI 对 {html.escape(str(group['qq_group_name']))} 的读取权限；"
                         "SSE 仍会继续保存新消息。"
                     )
+                elif action == "archive":
+                    group_key = str(form.get("group_key") or "")
+                    group = store.set_group_archived(
+                        group_key,
+                        archived=True,
+                        reason="用户在群访问网页手动归档",
+                        source="manual",
+                    )
+                    message = (
+                        f"已归档 {html.escape(str(group['qq_group_name']))}；"
+                        "保留历史只读访问和被动消息保存，停止 RP 与自动历史补偿。"
+                    )
+                elif action == "restore":
+                    group_key = str(form.get("group_key") or "")
+                    group = store.set_group_archived(
+                        group_key,
+                        archived=False,
+                        reason="用户在群访问网页恢复",
+                        source="manual",
+                    )
+                    health = store.runtime_status("session_health")
+                    generation = int(health.get("session_generation") or 0)
+                    active_account = store.active_qq_account()
+                    if generation > 0 and active_account is not None:
+                        store.enqueue_recovery_jobs(
+                            account_id=str(active_account["account_id"]),
+                            session_generation=generation,
+                        )
+                    message = (
+                        f"已恢复 {html.escape(str(group['qq_group_name']))}；"
+                        "该群重新纳入自动补偿范围，RP 仍需通过管理 MCP 单独启用。"
+                    )
                 else:
                     raise ValueError("未知访问授权操作")
                 store.capability(token, kind="group_access", consume=True)
@@ -117,6 +149,15 @@ def register_web_routes(
             candidates = {str(item["group_id"]): item for item in store.list_group_candidates()}
             requested_group_id = str(capability["payload"].get("group_id") or "")
             visible = dict(joined_by_id)
+            for group_id, group in whitelisted.items():
+                visible.setdefault(
+                    group_id,
+                    {
+                        "group_id": group_id,
+                        "group_name": group["qq_group_name"],
+                        "member_count": 0,
+                    },
+                )
             for group_id, candidate in candidates.items():
                 visible.setdefault(
                     group_id,
@@ -149,12 +190,32 @@ def register_web_routes(
                     discovery = "未知"
                 if group_id in whitelisted:
                     group = whitelisted[group_id]
-                    action = (
+                    archive_action = (
+                        '<form method="post"><input type="hidden" name="action" value="restore">'
+                        f'<input type="hidden" name="group_key" value="{html.escape(str(group["group_key"]))}">'
+                        '<button type="submit">恢复</button></form>'
+                        if group["archived"]
+                        else '<form method="post"><input type="hidden" name="action" value="archive">'
+                        f'<input type="hidden" name="group_key" value="{html.escape(str(group["group_key"]))}">'
+                        '<button type="submit">归档</button></form>'
+                    )
+                    revoke_action = (
                         '<form method="post"><input type="hidden" name="action" value="remove">'
                         f'<input type="hidden" name="group_key" value="{html.escape(str(group["group_key"]))}">'
                         '<button class="danger" type="submit">撤销 AI 访问</button></form>'
                     )
+                    state = (
+                        "已归档，只读"
+                        if group["archived"]
+                        else (
+                            "未归档，RP 已启用"
+                            if group["roleplay_enabled"]
+                            else "未归档，RP 已停用"
+                        )
+                    )
+                    action = archive_action + revoke_action
                 else:
+                    state = "未授权"
                     action = (
                         '<form method="post"><input type="hidden" name="action" value="add">'
                         f'<input type="hidden" name="group_id" value="{html.escape(group_id)}">'
@@ -162,12 +223,15 @@ def register_web_routes(
                     )
                 rows.append(
                     f"<tr><td>{name}</td><td>{html.escape(group_id)}</td>"
-                    f"<td>{html.escape(discovery)}</td><td>{action}</td></tr>"
+                    f"<td>{html.escape(discovery)}</td><td>{html.escape(state)}</td>"
+                    f"<td>{action}</td></tr>"
                 )
             body = (
-                '<p class="muted">所有群消息都会经 SSE 保存；这里只控制 AI/MCP 是否能读取正文。</p>'
+                '<p class="muted">所有群消息都会经 SSE 被动保存。归档保留历史只读访问，'
+                "但停止 RP 和主动历史补偿；撤销授权会令固定群 MCP 立即失效。</p>"
                 f"{registry_warning}"
-                "<table><thead><tr><th>群</th><th>群号</th><th>来源</th><th>操作</th></tr></thead>"
+                "<table><thead><tr><th>群</th><th>群号</th><th>来源</th>"
+                "<th>状态</th><th>操作</th></tr></thead>"
                 f"<tbody>{''.join(rows)}</tbody></table>"
             )
             return _page("QQ群 AI 访问授权", body)
@@ -343,6 +407,8 @@ def register_web_routes(
             capability = store.capability(token, kind="character_card")
             group_key = str(capability["group_key"])
             group = store.get_group(group_key)
+            if group["archived"]:
+                raise ValueError("GROUP_ARCHIVED：归档群只允许读取，不能上传人物卡")
             if request.method == "GET":
                 body = f"""
 <p>目标群：<strong>{html.escape(str(group["qq_group_name"]))}</strong></p>
@@ -404,6 +470,9 @@ def register_web_routes(
         token = str(request.path_params["token"])
         try:
             capability = store.capability(token, kind="character_card")
+            group = store.get_group(str(capability["group_key"]))
+            if group["archived"]:
+                raise ValueError("GROUP_ARCHIVED：归档群只允许读取，不能替换人物卡")
             payload = capability["payload"]
             staged_path = Path(str(payload.get("staged_path") or ""))
             if (  # noqa: ASYNC240 - a single local metadata check, no network filesystem
