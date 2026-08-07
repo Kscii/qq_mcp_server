@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, AuthContext
+from fastmcp.server.auth.auth import PrivateKeyJWTClientAuthenticator, TokenHandler
 from fastmcp.server.auth.jwt_issuer import JWTIssuer
 from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.dependencies import get_access_token, get_http_request
@@ -34,6 +35,7 @@ from mcp.server.auth.provider import (
     RefreshToken,
     TokenError,
 )
+from mcp.server.auth.routes import cors_middleware
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, Field
 from starlette.applications import Starlette
@@ -297,9 +299,47 @@ class _DynamicResourceGoogleProvider(GoogleProvider):
             }
         )
 
+    def _replace_cimd_token_route(self, routes: list[Route]) -> None:
+        """Keep private_key_jwt audience equal to the published token endpoint.
+
+        FastMCP 3.4.x formats its CIMD verifier URL as ``f"{base_url}/token"``.
+        Pydantic serializes an origin-only AnyHttpUrl with a trailing slash, so the
+        verifier expects ``//token`` while OAuth metadata publishes ``/token``.
+        Replace only that route until the FastMCP 4.x canonical endpoint fix is
+        available on a stable release.
+        """
+        if self._cimd_manager is None:
+            return
+        assert self.base_url is not None
+        token_endpoint_url = f"{str(self.base_url).rstrip('/')}/token"
+        token_handler = TokenHandler(
+            provider=self,
+            client_authenticator=PrivateKeyJWTClientAuthenticator(
+                provider=self,
+                cimd_manager=self._cimd_manager,
+                token_endpoint_url=token_endpoint_url,
+            ),
+        )
+        replacement = Route(
+            path="/token",
+            endpoint=cors_middleware(token_handler.handle, ["POST", "OPTIONS"]),
+            methods=["POST", "OPTIONS"],
+        )
+        matching_indexes = [
+            index
+            for index, route in enumerate(routes)
+            if route.path == "/token" and route.methods is not None and "POST" in route.methods
+        ]
+        if len(matching_indexes) != 1:
+            raise RuntimeError(
+                "FastMCP OAuth 路由结构已变化：无法安全安装 CIMD token endpoint 兼容修复"
+            )
+        routes[matching_indexes[0]] = replacement
+
     @override
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         routes = super().get_routes(mcp_path)
+        self._replace_cimd_token_route(routes)
         if mcp_path == "/mcp/groups/{group_key}":
             routes.append(
                 Route(

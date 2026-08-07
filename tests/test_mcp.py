@@ -9,6 +9,7 @@ from fastmcp import Client
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 
+from qq_mcp_server import mcp_server
 from qq_mcp_server.cards import CharacterCardService
 from qq_mcp_server.config import AppConfig
 from qq_mcp_server.mcp_server import _auth_provider, create_mcp_servers
@@ -79,6 +80,40 @@ async def test_oauth_provider_accepts_exact_admin_and_group_resources(
             ),
         )
         assert redirect.startswith("https://mcp.example.com/consent?txn_id=")
+
+
+def test_cimd_token_route_uses_published_canonical_endpoint(
+    config: AppConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "google-client")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "google-secret")
+    monkeypatch.setenv("MCP_JWT_SIGNING_KEY", "jwt-signing-key-for-tests")
+    monkeypatch.setenv("MCP_STORAGE_ENCRYPTION_KEY", "storage-encryption-key-for-tests")
+    public_config = replace(config, public_url="https://mcp.example.com")
+    store = MessageStore(public_config.database_path)
+    provider = _auth_provider(public_config, store)
+    assert provider is not None
+
+    captured_endpoints: list[str] = []
+    real_authenticator = mcp_server.PrivateKeyJWTClientAuthenticator
+
+    class CapturingAuthenticator(real_authenticator):
+        def __init__(self, *args: Any, token_endpoint_url: str, **kwargs: Any) -> None:
+            captured_endpoints.append(token_endpoint_url)
+            super().__init__(*args, token_endpoint_url=token_endpoint_url, **kwargs)
+
+    monkeypatch.setattr(mcp_server, "PrivateKeyJWTClientAuthenticator", CapturingAuthenticator)
+    routes = provider.get_routes("/mcp/admin")
+
+    assert captured_endpoints == ["https://mcp.example.com/token"]
+    assert "https://mcp.example.com//token" not in captured_endpoints
+    assert (
+        sum(
+            route.path == "/token" and route.methods is not None and "POST" in route.methods
+            for route in routes
+        )
+        == 1
+    )
 
 
 def message(message_id: str, text: str) -> ChatMessage:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from qq_mcp_server.release import without_release_version
+
 
 def deploy_text(name: str) -> str:
     return (Path("deploy") / name).read_text(encoding="utf-8")
@@ -63,3 +65,36 @@ def test_napcat_lifecycle_requires_explicit_maintenance() -> None:
     assert "docker update --restart=no" in maintenance
     assert "max_restarts_per_window=2" in recovery
     assert "restart_window_seconds=86400" in recovery
+
+
+def test_collector_release_check_ignores_only_project_version() -> None:
+    old_project = b'[project]\nname = "qq_mcp_server"\nversion = "0.8.0"\n'
+    new_project = b'[project]\nname = "qq_mcp_server"\nversion = "0.8.1"\n'
+    old_lock = (
+        b'[[package]]\nname = "qq-mcp-server"\nversion = "0.8.0"\nsource = { editable = "." }\n'
+    )
+    new_lock = (
+        b'[[package]]\nname = "qq-mcp-server"\nversion = "0.8.1"\nsource = { editable = "." }\n'
+    )
+
+    assert without_release_version(old_project, "pyproject.toml") == without_release_version(
+        new_project, "pyproject.toml"
+    )
+    assert without_release_version(old_lock, "uv.lock") == without_release_version(
+        new_lock, "uv.lock"
+    )
+
+
+def test_collector_release_check_keeps_dependency_changes() -> None:
+    old_project = b'[project]\nname = "qq_mcp_server"\nversion = "0.8.0"\ndependencies = ["a"]\n'
+    new_project = b'[project]\nname = "qq_mcp_server"\nversion = "0.8.1"\ndependencies = ["b"]\n'
+
+    assert without_release_version(old_project, "pyproject.toml") != without_release_version(
+        new_project, "pyproject.toml"
+    )
+
+
+def test_release_workflow_uses_collector_image_decision_helper() -> None:
+    workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    assert 'python src/qq_mcp_server/release.py "$previous" HEAD' in workflow

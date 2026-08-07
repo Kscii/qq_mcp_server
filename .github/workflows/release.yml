@@ -36,24 +36,8 @@ jobs:
             echo "deploy_collector=1" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if git diff --quiet "$previous" HEAD -- \
-            Dockerfile pyproject.toml uv.lock \
-            src/qq_mcp_server/application.py \
-            src/qq_mcp_server/cli.py \
-            src/qq_mcp_server/collector.py \
-            src/qq_mcp_server/config.py \
-            src/qq_mcp_server/gaps.py \
-            src/qq_mcp_server/models.py \
-            src/qq_mcp_server/normalization.py \
-            src/qq_mcp_server/onebot.py \
-            src/qq_mcp_server/runtime.py \
-            src/qq_mcp_server/store.py \
-            src/qq_mcp_server/sync.py \
-            deploy/compose.yaml deploy/config.server.toml; then
-            echo "deploy_collector=0" >> "$GITHUB_OUTPUT"
-          else
-            echo "deploy_collector=1" >> "$GITHUB_OUTPUT"
-          fi
+          deploy_collector="$(python src/qq_mcp_server/release.py "$previous" HEAD)"
+          echo "deploy_collector=$deploy_collector" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.30"
